@@ -44,8 +44,4 @@ extern EnvironmentAPI* Environment;
 // compiled VM. Our compile-time defaults disagree with the client for flags
 // that change how the shared heap, string interning and page allocator behave.
 // Must run before the first VM call that allocates or interns strings.
-// Always called from TeleportHandler (background thread): a CAS guard makes
-// the InitializeGameImpl call a no-op, so the game thread never pays the
-// registry-walk cost. RetryIfEmpty lets the early startup pass yield the
-// guard when the client registry is not available yet.
-void SyncClientLuauFlags(bool RetryIfEmpty = false);
+void SyncClientLuauFlags();

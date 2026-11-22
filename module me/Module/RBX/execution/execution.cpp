@@ -5,7 +5,6 @@
 #include <RBX/task_scheduler/task_scheduler.hpp>
 #include <ltable.h>
 #include <lstring.h>
-#include <chrono>
 #include <cstring>
 #include <cstdio>
 
@@ -401,15 +400,7 @@ void Execution::ExecuteScript(lua_State* L, std::string Script)
 		reinterpret_cast<void*>(State.Thread->userdata),
 		static_cast<int>(State.Thread->status));
 
-	const auto CompileStart = std::chrono::steady_clock::now();
 	std::string Bytecode = Execution::CompileScript(Script);
-	const auto CompileUs = std::chrono::duration_cast<std::chrono::microseconds>(
-		std::chrono::steady_clock::now() - CompileStart).count();
-	// O compile roda na game thread; deixar a duração explícita permite separar
-	// "o Luau demorou para compilar" de "o script demorou para rodar" quando se
-	// investiga travamento na execução.
-	LOGF("Execution", "Compiled %zu B source -> %zu B bytecode in %lld us (game thread)",
-		Script.size(), Bytecode.size(), static_cast<long long>(CompileUs));
 	if (!Bytecode.empty() && Bytecode[0] == '\0')
 	{
 		// The compiler encodes failure as a leading zero byte followed by the

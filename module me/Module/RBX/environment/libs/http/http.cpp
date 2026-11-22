@@ -121,7 +121,21 @@ module::core::environment::parsed_url_t module::core::environment::c_http::parse
     if (colon != std::string::npos)
     {
         p.host = host_port.substr(0, colon);
-        p.port = std::stoi(host_port.substr(colon + 1));
+        // std::stoi throws on malformed ports (e.g. "ws://host:abc/").
+        const std::string portText = host_port.substr(colon + 1);
+        int parsedPort = 0;
+        try
+        {
+            std::size_t consumed = 0;
+            parsedPort = std::stoi(portText, &consumed);
+            if (consumed != portText.size() || parsedPort <= 0 || parsedPort > 65535)
+                parsedPort = 0;
+        }
+        catch (...)
+        {
+            parsedPort = 0;
+        }
+        p.port = parsedPort ? parsedPort : (p.scheme == ("https") ? 443 : 80);
     }
     else
     {
@@ -309,30 +323,30 @@ static void read_game_ids(lua_State* L, std::string& job_id, std::string& place_
     lua_pop(L, 1);
 }
 
-// A repeated game:HttpGet on the same url returns the cached body, and the
-// optional NoCache argument forces a fresh request (debUNC checks both sides).
-static std::mutex httpCacheMutex;
-static std::unordered_map<std::string, std::string> httpCache;
+    // A repeated game:HttpGet on the same url returns the cached body, and the
+    // optional NoCache argument forces a fresh request (debUNC checks both sides).
+    static std::mutex httpCacheMutex;
+    static std::unordered_map<std::string, std::string> httpCache;
 
-static bool http_cache_lookup(const std::string& url, std::string& out)
-{
-    std::lock_guard<std::mutex> lock(httpCacheMutex);
-    auto it = httpCache.find(url);
-    if (it == httpCache.end())
-        return false;
+    static bool http_cache_lookup(const std::string& url, std::string& out)
+    {
+        std::lock_guard<std::mutex> lock(httpCacheMutex);
+        auto it = httpCache.find(url);
+        if (it == httpCache.end())
+            return false;
 
-    out = it->second;
-    return true;
-}
+        out = it->second;
+        return true;
+    }
 
-static void http_cache_store(const std::string& url, const std::string& body)
-{
-    std::lock_guard<std::mutex> lock(httpCacheMutex);
-    if (httpCache.size() > 64)
-        httpCache.clear();
+    static void http_cache_store(const std::string& url, const std::string& body)
+    {
+        std::lock_guard<std::mutex> lock(httpCacheMutex);
+        if (httpCache.size() > 64)
+            httpCache.clear();
 
-    httpCache[url] = body;
-}
+        httpCache[url] = body;
+    }
 
 inline int module::core::environment::c_http::http_get(lua_State* L)
 {
@@ -390,11 +404,11 @@ inline int module::core::environment::c_http::http_get(lua_State* L)
     headers.insert({ ("Roblox-Session-Id"), session_id_json.dump() });
     headers.insert({ ("Roblox-Place-Id"), place_id });
     headers.insert({ ("Roblox-Game-Id"), game_id });
-    headers.insert({ ("Exploit-Identifier"), ("UniverseSt") });
+    headers.insert({ ("Exploit-Identifier"), ("Paradox") });
     headers.insert({ ("Exploit-Guid"), hwid });
     headers.insert({ ("Fingerprint"), hwid });
-    headers.insert({ ("UniverseSt-Fingerprint"), hwid });
-    headers.insert({ ("UniverseSt-User-Identifier"), hwid });
+    headers.insert({ ("Paradox-Fingerprint"), hwid });
+    headers.insert({ ("Paradox-User-Identifier"), hwid });
     headers.insert({ ("Accept"), ("*/*") });
 
     return Yielding::YieldExecution(L, [url, headers, noCache]() -> std::function<int(lua_State*)>
@@ -539,7 +553,7 @@ inline int module::core::environment::c_http::request(lua_State* L)
         };
 
     if (!has_header(("User-Agent")))
-        headers.insert({ ("User-Agent"), ("UniverseSt/1.0.5") });
+        headers.insert({ ("User-Agent"), ("Paradox/1.0") });
     if (!has_header(("Roblox-Session-Id")))
         headers.insert({ ("Roblox-Session-Id"), session_id_json.dump() });
     if (!has_header(("Roblox-Place-Id")))
@@ -547,15 +561,15 @@ inline int module::core::environment::c_http::request(lua_State* L)
     if (!has_header(("Roblox-Game-Id")))
         headers.insert({ ("Roblox-Game-Id"), game_id });
     if (!has_header(("Exploit-Identifier")))
-        headers.insert({ ("Exploit-Identifier"), ("UniverseSt") });
+        headers.insert({ ("Exploit-Identifier"), ("Paradox") });
     if (!has_header(("Exploit-Guid")))
         headers.insert({ ("Exploit-Guid"), hwid });
     if (!has_header(("Fingerprint")))
         headers.insert({ ("Fingerprint"), hwid });
-    if (!has_header(("UniverseSt-Fingerprint")))
-        headers.insert({ ("UniverseSt-Fingerprint"), hwid });
-    if (!has_header(("UniverseSt-User-Identifier")))
-        headers.insert({ ("UniverseSt-User-Identifier"), hwid });
+    if (!has_header(("Paradox-Fingerprint")))
+        headers.insert({ ("Paradox-Fingerprint"), hwid });
+    if (!has_header(("Paradox-User-Identifier")))
+        headers.insert({ ("Paradox-User-Identifier"), hwid });
     if (!has_header(("Accept")))
         headers.insert({ ("Accept"), ("*/*") });
 
@@ -689,11 +703,11 @@ inline int module::core::environment::c_http::http_post(lua_State* L)
     headers.insert({ ("Roblox-Session-Id"), session_id_json.dump() });
     headers.insert({ ("Roblox-Place-Id"), place_id });
     headers.insert({ ("Roblox-Game-Id"), game_id });
-    headers.insert({ ("Exploit-Identifier"), ("UniverseSt") });
+    headers.insert({ ("Exploit-Identifier"), ("Paradox") });
     headers.insert({ ("Exploit-Guid"), hwid });
     headers.insert({ ("Fingerprint"), hwid });
-    headers.insert({ ("UniverseSt-Fingerprint"), hwid });
-    headers.insert({ ("UniverseSt-User-Identifier"), hwid });
+    headers.insert({ ("Paradox-Fingerprint"), hwid });
+    headers.insert({ ("Paradox-User-Identifier"), hwid });
     headers.insert({ ("Accept"), ("*/*") });
 
     return Yielding::YieldExecution(L, [url, body, headers, content_type]() -> std::function<int(lua_State*)>

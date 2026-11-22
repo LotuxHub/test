@@ -117,7 +117,17 @@ namespace Websocket
                 if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos)
                     return out;
 
-                out.port = static_cast<INTERNET_PORT>(std::stoul(digits));
+                try
+                {
+                    const unsigned long value = std::stoul(digits);
+                    if (value == 0 || value > 65535)
+                        return out;
+                    out.port = static_cast<INTERNET_PORT>(value);
+                }
+                catch (...)
+                {
+                    return out;
+                }
             }
 
             out.host = widen(authority);

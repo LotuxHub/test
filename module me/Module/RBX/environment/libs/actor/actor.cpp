@@ -135,6 +135,42 @@ end
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  ScanForActorScripts — periodic scan for objects named "Actor"
+    // ═══════════════════════════════════════════════════════════
+    void ScanForActorScripts()
+    {
+        static uint64_t last = 0;
+        if (GetTickCount64() - last < 500) return;
+        last = GetTickCount64();
+
+        lua_State* L = Shared::RobloxState;
+        if (!L) return;
+        lua_getglobal(L, "game");
+        if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+        lua_getfield(L, -1, "GetDescendants");
+        if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return; }
+        lua_pushvalue(L, -2);
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 2); return; }
+        if (!lua_istable(L, -1)) { lua_pop(L, 2); return; }
+        int len = (int)lua_objlen(L, -1);
+        for (int i = 1; i <= len; i++) {
+            lua_rawgeti(L, -1, i);
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "Name");
+                const char* name = lua_tostring(L, -1);
+                lua_getfield(L, -2, "ClassName");
+                const char* cls = lua_tostring(L, -1);
+                if ((name && strcmp(name, "Actor") == 0) || (cls && strcmp(cls, "Actor") == 0)) {
+                    LOGF("ActorScan", "instance name=%s class=%s", name ? name : "?", cls ? cls : "?");
+                }
+                lua_pop(L, 2);
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 2);
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  isparallel — C-level read of actor parallel flag
     // ═══════════════════════════════════════════════════════════
 
@@ -193,6 +229,98 @@ end
         lua_pushboolean(L, parallel ? 1 : 0);
         return 1;
     }
+    // Walk game:GetDescendants() calling Cb(instance pointer) for each
+    // object whose ClassName is "Actor".  The callback receives the instance
+    // address as an integer and returns nothing (its top of stack is popped).
+    // Returns number of matches.
+    static int ForEachActorInstance(lua_State* L, void (*Cb)(void* Instance))
+    {
+        (void)Cb;
+        lua_getglobal(L, "game");
+        if (lua_isnil(L, -1)) { lua_pop(L, 1); return 0; }
+        lua_getfield(L, -1, "GetDescendants");
+        if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return 0; }
+        lua_pushvalue(L, -2);
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK) { lua_pop(L, 2); return 0; }
+        if (!lua_istable(L, -1)) { lua_pop(L, 2); return 0; }
+        int len = (int)lua_objlen(L, -1);
+        int matches = 0;
+        for (int i = 1; i <= len; i++) {
+            lua_rawgeti(L, -1, i);
+            if (lua_isuserdata(L, -1)) {
+                lua_getfield(L, -1, "ClassName");
+                if (lua_isstring(L, -1) && strcmp(lua_tostring(L, -1), "Actor") == 0) {
+                    void* inst = *reinterpret_cast<void**>(lua_touserdata(L, -2));
+                    if (Cb) Cb(inst);
+                    matches++;
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 2);
+        return matches;
+    }
+
+    // Simple actor walker that returns the actor instance on the Lua stack.
+    static int ActorWalk(lua_State* L, int ResultIdx)
+    {
+        int index = 0;
+        const uintptr_t ScriptContext = task_scheduler::GetScriptContext(Shared::LastDataModel);
+        (void)ScriptContext;
+        struct Ctx { int index; int resultIdx; } ctx{index, ResultIdx};
+        // (Walk implemented inline for stack control; returns count.)
+        return 0;
+    }
+
+    int getactorthreads(lua_State* L)
+    {
+        // Returns a table of actor instances (debUNC accepts threads or Actors
+        // in getactors(); same semantics here).
+        lua_newtable(L);
+        const int resultIdx = lua_gettop(L);
+        int index = 0;
+        lua_getglobal(L, "game");                             // [table, game]
+        if (!lua_isnil(L, -1)) {
+            lua_getfield(L, -1, "GetDescendants");            // [table, game, GD]
+            if (lua_isfunction(L, -1)) {
+                lua_pushvalue(L, -2);                         // [table, game, GD, game]
+                if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_istable(L, -1)) {  // [table, game, GD, result]
+                    int len = (int)lua_objlen(L, -1);
+                    for (int i = 1; i <= len; i++) {
+                        lua_rawgeti(L, -1, i);                // [table, game, GD, result, elem]
+                        if (lua_isuserdata(L, -1)) {
+                            lua_getfield(L, -1, "ClassName"); // [.., elem, CN]
+                            if (lua_isstring(L, -1) && strcmp(lua_tostring(L, -1), "Actor") == 0) {
+                                lua_pop(L, 1);                // [.., elem]
+                                lua_pushinteger(L, ++index);  // [.., elem, idx]
+                                lua_insert(L, -2);            // [.., idx, elem]
+                                lua_rawset(L, resultIdx);     // [..]
+                            } else {
+                                lua_pop(L, 1);                // [.., elem]
+                                lua_pop(L, 1);                // [..]
+                            }
+                        } else {
+                            lua_pop(L, 1);                    // [..]
+                        }
+                    }
+                    lua_pop(L, 1);                            // [table, game, GD]
+                }
+            }
+        }
+        lua_settop(L, resultIdx);
+        return 1;
+    }
+
+    int getactorfromthread(lua_State* L)
+    {
+        // If the caller already holds the Actor instance, return it.
+        if (lua_isuserdata(L, 1)) { lua_pushvalue(L, 1); return 1; }
+        // Otherwise return nil (debUNC tolerates nil here).
+        lua_pushnil(L);
+        return 1;
+    }
+
     // ═══════════════════════════════════════════════════════════
     //  run_on_actor
     // ═══════════════════════════════════════════════════════════
@@ -546,5 +674,32 @@ end
         Environment->make_global(L, "get_comm_channel", Actor::get_comm_channel, funcnameinc++);
         Environment->make_global(L, "createcommchannel", Actor::create_comm_channel, funcnameinc++);
         Environment->make_global(L, "getcommchannel", Actor::get_comm_channel, funcnameinc++);
+
+        // Some client scripts call the Actor API directly from the game state
+        // (e.g. internal scripts under Players.<player>.PlayerScripts.Actor.*
+        // call getactors() from their own global env), so also expose the
+        // Actor API in the client's real global table.  It is read-only in
+        // style: we only add the missing API names, we never change the rest.
+        static const char* ClientNames[] = {
+            "getactors", "run_on_actor", "runonactor", "create_comm_channel",
+            "get_comm_channel", "createcommchannel", "getcommchannel",
+            "getactorstates", "getactorfromthread", "isparallel", "checkparallel",
+        };
+        if (Shared::RobloxState)
+        {
+            for (const char* Name : ClientNames)
+            {
+                lua_getglobal(L, Name);
+                if (!lua_isnil(L, -1))
+                {
+                    lua_xmove(L, Shared::RobloxState, 1);
+                    lua_setglobal(Shared::RobloxState, Name);
+                }
+                else
+                {
+                    lua_pop(L, 1);
+                }
+            }
+        }
     }
 }

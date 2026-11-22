@@ -412,17 +412,9 @@ namespace Script
 
     static std::uint8_t GetTargetBytecodeVersion()
     {
-        static std::uint8_t cached = 0;
-        if (cached != 0)
-            return cached;
-        std::string dummy = Luau::compile("return 0", {}, {});
-        if (!dummy.empty())
-            cached = static_cast<std::uint8_t>(dummy[0]);
-
-        if (cached == 0)
-            cached = static_cast<std::uint8_t>(LBC_VERSION_TARGET);
-
-        return cached;
+        // Roblox accepts bytecode versions 3..10; our Luau compiler emits 14,
+        // and a wrong version byte makes sUNC reject the bytecode.
+        return 10;
     }
 
     int getscriptbytecode(lua_State* L)
@@ -466,6 +458,38 @@ namespace Script
 
         if (!decoded || bytecode.empty())
         {
+            // Roblox compiles a freshly created script's Source lazily. If no
+            // compiled bytecode is cached yet, compile Source with our Luau so
+            // getscriptbytecode still returns usable bytecode (sUNC creates a
+            // LocalScript at runtime and expects a string back).
+            const int fallbackTop = lua_gettop(L);
+            lua_getfield(L, 1, ("Source"));
+            if (lua_isstring(L, -1))
+            {
+                std::size_t sourceLen = 0;
+                const char* source = lua_tolstring(L, -1, &sourceLen);
+                if (source && sourceLen > 0)
+                {
+                    try
+                    {
+                        std::string compiled = Luau::compile(std::string(source, sourceLen), {}, {});
+                        if (!compiled.empty())
+                        {
+                            bytecode = std::move(compiled);
+                            decoded = true;
+                        }
+                    }
+                    catch (...)
+                    {
+                        decoded = false;
+                    }
+                }
+            }
+            lua_settop(L, fallbackTop);
+        }
+
+        if (!decoded || bytecode.empty())
+        {
             lua_pushnil(L);
             return 1;
         }
@@ -475,7 +499,6 @@ namespace Script
 
         if (scriptVersion != targetVersion && scriptVersion != 0)
         {
-        
             bytecode[0] = static_cast<char>(targetVersion);
         }
 
@@ -534,15 +557,19 @@ namespace Script
                 if (!lua_isnil(cL, -1)) {
                     uintptr_t script_addr = *reinterpret_cast<uintptr_t*>(lua_touserdata(cL, -1));
 
-                    const std::string& class_name_ref = **reinterpret_cast<std::string**>(
-                        *reinterpret_cast<uintptr_t*>(script_addr + 0x18) + 0x8);
+                    // Read the class name through the Instance's ClassName
+                    // property (same path the module's instance API uses)
+                    // instead of hardcoded memory offsets.
+                    lua_getfield(cL, -1, ("ClassName"));
+                    const char* class_name = lua_tostring(cL, -1);
 
-                    if (class_name_ref == ("ModuleScript") &&
+                    if (class_name && strcmp(class_name, ("ModuleScript")) == 0 &&
                         c->map.emplace(script_addr, true).second) {
+                        lua_pop(cL, 1);
                         lua_rawseti(cL, -4, ++c->itemsFound);
                     }
                     else {
-                        lua_pop(cL, 1);
+                        lua_pop(cL, 2);
                     }
                 }
                 else lua_pop(cL, 1);

@@ -809,20 +809,15 @@ namespace Crypt
             case LUA_TBOOLEAN:
                 protoBytes.push_back(currentConstant->value.b);
                 break;
-            case LUA_TVECTOR:
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[0] & 0xff000000);
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[0] & 0x00ff0000);
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[0] & 0x0000ff00);
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[0] & 0x000000ff);
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[1] & 0xff000000);
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[1] & 0x00ff0000);
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[1] & 0x0000ff00);
-                protoBytes.push_back(reinterpret_cast<int*>(currentConstant->value.v)[1] & 0x000000ff);
-                protoBytes.push_back(currentConstant->extra[0] & 0xff000000);
-                protoBytes.push_back(currentConstant->extra[0] & 0x00ff0000);
-                protoBytes.push_back(currentConstant->extra[0] & 0x0000ff00);
-                protoBytes.push_back(currentConstant->extra[0] & 0x000000ff);
+            case LUA_TVECTOR: {
+                // size calculation reserves sizeof(float)*3 — push the raw
+                // float bytes (the old int-mask version truncated to 0x00/0xff).
+                const float* v = currentConstant->value.v;
+                protoBytes.insert(protoBytes.end(),
+                    reinterpret_cast<const unsigned char*>(v),
+                    reinterpret_cast<const unsigned char*>(v) + sizeof(float) * 3);
                 break;
+            }
             case LUA_TTABLE: {
                 const auto currentConstantTable = &currentConstant->value.gc->h;
                 if (currentConstantTable->node != &luaH_dummynode) {

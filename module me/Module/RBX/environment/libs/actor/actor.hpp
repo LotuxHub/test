@@ -19,6 +19,8 @@ namespace Actor
     int create_comm_channel(lua_State* L);
     int get_comm_channel(lua_State* L);
 
+    void ScanForActorScripts();
+
 
     void register_lib(lua_State* L);
 }

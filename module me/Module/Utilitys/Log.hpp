@@ -28,11 +28,6 @@ namespace LogFile
         CRITICAL_SECTION lock;
         HANDLE handle;
         char path[MAX_PATH];
-        // relógio de parede derivado (base + tick) e controle do flush periódico
-        ULONGLONG bootTick;
-        ULONGLONG baseMs;
-        DWORD pendingLines;
-        ULONGLONG lastFlush;
     };
 
     inline State MakeState()
@@ -42,17 +37,6 @@ namespace LogFile
         InitializeCriticalSection(&state.lock);
         state.handle = INVALID_HANDLE_VALUE;
         state.path[0] = '\0';
-
-        state.bootTick = GetTickCount64();
-        state.pendingLines = 0;
-        state.lastFlush = state.bootTick;
-
-        SYSTEMTIME now{};
-        GetLocalTime(&now);
-        state.baseMs = static_cast<ULONGLONG>(now.wHour) * 3600000ULL +
-            static_cast<ULONGLONG>(now.wMinute) * 60000ULL +
-            static_cast<ULONGLONG>(now.wSecond) * 1000ULL +
-            static_cast<ULONGLONG>(now.wMilliseconds);
 
         char module_path[MAX_PATH]{};
         HMODULE module = nullptr;
@@ -96,21 +80,6 @@ namespace LogFile
         return Get().path;
     }
 
-    // "HH:MM:SS.mmm" do relógio de parede, derivado de base + GetTickCount64 —
-    // sem syscalls custosos por linha. Toda linha ganha timestamp para medir a
-    // duração de cada fase (init, sync de FFlags, compile de script) pela
-    // diferença entre linhas consecutivas do Logs.log.
-    inline void Stamp(char* Out, size_t Size)
-    {
-        const State& state = Get();
-        const ULONGLONG Ms = (state.baseMs + (GetTickCount64() - state.bootTick)) % 86400000ULL;
-        snprintf(Out, Size, "[%02u:%02u:%02u.%03u] ",
-            static_cast<unsigned>(Ms / 3600000ULL),
-            static_cast<unsigned>((Ms / 60000ULL) % 60ULL),
-            static_cast<unsigned>((Ms / 1000ULL) % 60ULL),
-            static_cast<unsigned>(Ms % 1000ULL));
-    }
-
     inline void Write(const char* text, int length)
     {
         if (!text || length <= 0)
@@ -124,18 +93,7 @@ namespace LogFile
 
         DWORD written = 0;
         WriteFile(state.handle, text, static_cast<DWORD>(length), &written, nullptr);
-
-        // Flush periódico (≤200 ms ou 32 linhas) em vez de um por linha: um
-        // FlushFileBuffers a cada LOGF sincroniza o disco — e o OneDrive, que
-        // indexa esta pasta — dezenas de vezes por segundo durante a execução
-        // de scripts. Cada linha de log virava um travamento potencial.
-        const ULONGLONG Now = GetTickCount64();
-        if (++state.pendingLines >= 32 || Now - state.lastFlush >= 200)
-        {
-            FlushFileBuffers(state.handle);
-            state.pendingLines = 0;
-            state.lastFlush = Now;
-        }
+        FlushFileBuffers(state.handle);
 
         LeaveCriticalSection(&state.lock);
     }
@@ -147,9 +105,7 @@ namespace LogFile
             return;
 
         char line[512]{};
-        char stamp[24]{};
-        Stamp(stamp, sizeof(stamp));
-        const int length = snprintf(line, sizeof(line), "%sCALL %s\n", stamp, name);
+        const int length = snprintf(line, sizeof(line), "CALL %s\n", name);
         Write(line, length);
     }
 
@@ -159,10 +115,8 @@ namespace LogFile
         if (!text)
             return;
 
-        char line[2400]{};
-        char stamp[24]{};
-        Stamp(stamp, sizeof(stamp));
-        const int length = snprintf(line, sizeof(line), "%s[%s] %s\n", stamp, source ? source : "log", text);
+        char line[2300]{};
+        const int length = snprintf(line, sizeof(line), "[%s] %s\n", source ? source : "log", text);
         Write(line, length);
     }
 }

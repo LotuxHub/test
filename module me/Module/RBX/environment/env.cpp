@@ -1,5 +1,3 @@
-#include <atomic>
-#include <cstring>
 #include <RBX/environment/env.hpp>
 #include <RBX/environment/hooks/hooks.hpp>
 
@@ -302,121 +300,104 @@ namespace
 	}
 }
 
-void SyncClientLuauFlags(bool RetryIfEmpty)
+void SyncClientLuauFlags()
 {
-    // Guard atômico: TeleportHandler (thread de fundo) e a game thread podem
-    // chamar esta função "ao mesmo tempo". O CAS garante que só a primeira
-    // execução faça o trabalho; a segunda retorna imediatamente. Assim é
-    // impossível a game thread pagar o custo de ~minutos caminhando o registry
-    // de FFlags do cliente na primeira entrada em um jogo.
-    static std::atomic<bool> AlreadySynced{ false };
-    bool Expected = false;
-    if (!AlreadySynced.compare_exchange_strong(Expected, true))
-        return;
+	static bool AlreadySynced = false;
+	if (AlreadySynced)
+		return;
+	AlreadySynced = true;
 
-    struct BoolFlagBinding
-    {
-        const char* Name;
-        Luau::FValue<bool>* Local;
-    };
+	struct BoolFlagBinding
+	{
+		const char* Name;
+		Luau::FValue<bool>* Local;
+	};
 
-    struct IntFlagBinding
-    {
-        const char* Name;
-        Luau::FValue<int>* Local;
-    };
+	struct IntFlagBinding
+	{
+		const char* Name;
+		Luau::FValue<int>* Local;
+	};
 
-    static const BoolFlagBinding kBoolFlags[] = {
-        { "LuauBufferCage", &FFlag::LuauBufferCage },
-        { "LuauBufferSweep", &FFlag::LuauBufferSweep },
-        { "LuauCageSplitData", &FFlag::LuauCageSplitData },
-        { "LuauCoroutineFinally", &FFlag::LuauCoroutineFinally },
-        { "LuauGcTraceUdata", &FFlag::LuauGcTraceUdata },
-        { "LuauIsYieldableSimplify", &FFlag::LuauIsYieldableSimplify },
-        { "LuauLoadExplicitGcDisable", &FFlag::LuauLoadExplicitGcDisable },
-        { "LuauPcallErrorContinuationReentry", &FFlag::LuauPcallErrorContinuationReentry },
-        { "LuauPromoteProto", &FFlag::LuauPromoteProto },
-        { "LuauRuntimeFeedback", &FFlag::LuauRuntimeFeedback },
-        { "LuauSaltedInterningTable", &FFlag::LuauSaltedInterningTable },
-        { "LuauSandboxFreezesVectorMetatable", &FFlag::LuauSandboxFreezesVectorMetatable },
-        { "LuauSkipDebugLocked", &FFlag::LuauSkipDebugLocked },
-        { "DebugLuauBufferVectorLibrary", &FFlag::DebugLuauBufferVectorLibrary },
-        { "DebugLuauUserDefinedClassesRuntime", &FFlag::DebugLuauUserDefinedClassesRuntime },
-        { "FixMathNoisePrecision", &FFlag::FixMathNoisePrecision },
-        { "LuauGcHeapShrinkFix", &DFFlag::LuauGcHeapShrinkFix },
-        { "LuauOptimizeStringGsub", &DFFlag::LuauOptimizeStringGsub },
-        { "LuauOptimizeStringSplit", &DFFlag::LuauOptimizeStringSplit },
-    };
+	static const BoolFlagBinding kBoolFlags[] = {
+		{ "LuauBufferCage", &FFlag::LuauBufferCage },
+		{ "LuauBufferSweep", &FFlag::LuauBufferSweep },
+		{ "LuauCageSplitData", &FFlag::LuauCageSplitData },
+		{ "LuauCoroutineFinally", &FFlag::LuauCoroutineFinally },
+		{ "LuauGcTraceUdata", &FFlag::LuauGcTraceUdata },
+		{ "LuauIsYieldableSimplify", &FFlag::LuauIsYieldableSimplify },
+		{ "LuauLoadExplicitGcDisable", &FFlag::LuauLoadExplicitGcDisable },
+		{ "LuauPcallErrorContinuationReentry", &FFlag::LuauPcallErrorContinuationReentry },
+		{ "LuauPromoteProto", &FFlag::LuauPromoteProto },
+		{ "LuauRuntimeFeedback", &FFlag::LuauRuntimeFeedback },
+		{ "LuauSaltedInterningTable", &FFlag::LuauSaltedInterningTable },
+		{ "LuauSandboxFreezesVectorMetatable", &FFlag::LuauSandboxFreezesVectorMetatable },
+		{ "LuauSkipDebugLocked", &FFlag::LuauSkipDebugLocked },
+		{ "DebugLuauBufferVectorLibrary", &FFlag::DebugLuauBufferVectorLibrary },
+		{ "DebugLuauUserDefinedClassesRuntime", &FFlag::DebugLuauUserDefinedClassesRuntime },
+		{ "FixMathNoisePrecision", &FFlag::FixMathNoisePrecision },
+		{ "LuauGcHeapShrinkFix", &DFFlag::LuauGcHeapShrinkFix },
+		{ "LuauOptimizeStringGsub", &DFFlag::LuauOptimizeStringGsub },
+		{ "LuauOptimizeStringSplit", &DFFlag::LuauOptimizeStringSplit },
+	};
 
-    static const IntFlagBinding kIntFlags[] = {
-        { "LuauInlineHitsThreshold", &FInt::LuauInlineHitsThreshold },
-    };
+	static const IntFlagBinding kIntFlags[] = {
+		{ "LuauInlineHitsThreshold", &FInt::LuauInlineHitsThreshold },
+	};
 
-    int Matched = 0;
-    int Changed = 0;
-    int Missing = 0;
+	int Matched = 0;
+	int Changed = 0;
+	int Missing = 0;
 
-    for (const BoolFlagBinding& Binding : kBoolFlags)
-    {
-        ClientFlagKind Kind = ClientFlagKind::Unknown;
-        const uintptr_t Storage = FindClientFlagStorage(Binding.Name, Kind);
-        unsigned char ClientValue = 0;
-        if (Kind != ClientFlagKind::Boolean || !SafeReadFlag(Storage, &ClientValue, sizeof(ClientValue)))
-        {
-            ++Missing;
-            LOGF("Environment", "Luau flag %s: client value unavailable, keeping local=%d",
-                Binding.Name, Binding.Local->value ? 1 : 0);
-            continue;
-        }
+	for (const BoolFlagBinding& Binding : kBoolFlags)
+	{
+		ClientFlagKind Kind = ClientFlagKind::Unknown;
+		const uintptr_t Storage = FindClientFlagStorage(Binding.Name, Kind);
+		unsigned char ClientValue = 0;
+		if (Kind != ClientFlagKind::Boolean || !SafeReadFlag(Storage, &ClientValue, sizeof(ClientValue)))
+		{
+			++Missing;
+			LOGF("Environment", "Luau flag %s: client value unavailable, keeping local=%d",
+				Binding.Name, Binding.Local->value ? 1 : 0);
+			continue;
+		}
 
-        ++Matched;
-        const bool ClientBool = ClientValue != 0;
-        if (Binding.Local->value != ClientBool)
-        {
-            ++Changed;
-            LOGF("Environment", "Luau flag %s: local=%d -> client=%d",
-                Binding.Name, Binding.Local->value ? 1 : 0, ClientBool ? 1 : 0);
-            Binding.Local->value = ClientBool;
-        }
-    }
+		++Matched;
+		const bool ClientBool = ClientValue != 0;
+		if (Binding.Local->value != ClientBool)
+		{
+			++Changed;
+			LOGF("Environment", "Luau flag %s: local=%d -> client=%d",
+				Binding.Name, Binding.Local->value ? 1 : 0, ClientBool ? 1 : 0);
+			Binding.Local->value = ClientBool;
+		}
+	}
 
-    for (const IntFlagBinding& Binding : kIntFlags)
-    {
-        ClientFlagKind Kind = ClientFlagKind::Unknown;
-        const uintptr_t Storage = FindClientFlagStorage(Binding.Name, Kind);
-        int ClientValue = 0;
-        if (Kind != ClientFlagKind::Integer || !SafeReadFlag(Storage, &ClientValue, sizeof(ClientValue)))
-        {
-            ++Missing;
-            LOGF("Environment", "Luau flag %s: client value unavailable, keeping local=%d",
-                Binding.Name, Binding.Local->value);
-            continue;
-        }
+	for (const IntFlagBinding& Binding : kIntFlags)
+	{
+		ClientFlagKind Kind = ClientFlagKind::Unknown;
+		const uintptr_t Storage = FindClientFlagStorage(Binding.Name, Kind);
+		int ClientValue = 0;
+		if (Kind != ClientFlagKind::Integer || !SafeReadFlag(Storage, &ClientValue, sizeof(ClientValue)))
+		{
+			++Missing;
+			LOGF("Environment", "Luau flag %s: client value unavailable, keeping local=%d",
+				Binding.Name, Binding.Local->value);
+			continue;
+		}
 
-        ++Matched;
-        if (Binding.Local->value != ClientValue)
-        {
-            ++Changed;
-            LOGF("Environment", "Luau flag %s: local=%d -> client=%d",
-                Binding.Name, Binding.Local->value, ClientValue);
-            Binding.Local->value = ClientValue;
-        }
-    }
+		++Matched;
+		if (Binding.Local->value != ClientValue)
+		{
+			++Changed;
+			LOGF("Environment", "Luau flag %s: local=%d -> client=%d",
+				Binding.Name, Binding.Local->value, ClientValue);
+			Binding.Local->value = ClientValue;
+		}
+	}
 
-    LOGF("Environment", "Luau flags: %d matched, %d changed, %d unavailable",
-        Matched, Changed, Missing);
-
-    if (Matched == 0 && RetryIfEmpty)
-    {
-        // Passagem antecipada (início da TeleportHandler) sem nenhum flag
-        // resolvido: provavelmente o registry do cliente ainda não existia.
-        // Libera o guard para que a chamada antes de instalar a vtable — que
-        // também roda em thread de fundo — tente de novo. Apenas a passagem
-        // antecipada libera retry: se a segunda falhar, o guard permanece
-        // fechado e a game thread continua isenta do custo.
-        AlreadySynced = false;
-        LOGF("Environment", "Luau flags: none resolved on early pass; will retry before the job hook");
-    }
+	LOGF("Environment", "Luau flags: %d matched, %d changed, %d unavailable",
+		Matched, Changed, Missing);
 }
 
 

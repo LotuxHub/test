@@ -36,7 +36,7 @@ __forceinline static bool IsPtrValid(T value)
     return true;
 }
 
-__declspec(noinline) bool signal_safe_read(const void* address, void* output, size_t size)
+inline bool signal_safe_read(const void* address, void* output, size_t size)
 {
     if (!address || !output || !size)
         return false;
@@ -59,7 +59,7 @@ __declspec(noinline) bool signal_safe_read(const void* address, void* output, si
     }
 }
 
-__declspec(noinline) bool signal_safe_write(void* address, const void* value, size_t size)
+inline bool signal_safe_write(void* address, const void* value, size_t size)
 {
     MEMORY_BASIC_INFORMATION info{};
     if (!address || !value || !VirtualQuery(address, &info, sizeof(info)) ||
@@ -73,23 +73,6 @@ __declspec(noinline) bool signal_safe_write(void* address, const void* value, si
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         return false;
-    }
-}
-
-// SEH helper em escopo de arquivo — fora de qualquer classe/namespace para
-// que o MSVC não herde o requisito de unwinding de objetos C++ da classe
-// circundante (C2712). Usa void* para não depender de tipos declarados abaixo.
-// Chama fn(a, b, c, d) e retorna 0 em sucesso ou o código de exceção em falha.
-static DWORD TryCallVtableFn(void* fn, void* a, void* b, void* c, void* d) noexcept
-{
-    __try
-    {
-        reinterpret_cast<void(*)(void*, void*, void*, void*)>(fn)(a, b, c, d);
-        return 0;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return GetExceptionCode();
     }
 }
 
@@ -276,8 +259,7 @@ static bool connection_once_state(uintptr_t connection, bool retire = false) {
     if (retire) {
         fired = 1;
         signal_safe_write(reinterpret_cast<void*>(slot + ClientOffsets::Signal::SignalSlot::onceFired), &fired, sizeof(fired));
-    }
-    else {
+    } else {
         signal_safe_read(reinterpret_cast<void*>(slot + ClientOffsets::Signal::SignalSlot::onceFired), &fired, sizeof(fired));
     }
     return fired == 1;
@@ -822,7 +804,7 @@ namespace Signals {
 
     int fireproximityprompt(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         lua_getglobal(L, ("typeof"));
@@ -850,7 +832,7 @@ namespace Signals {
 
     int fireclickdetector(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         auto FireDistance = luaL_optnumber(L, 2, 0);
@@ -1056,8 +1038,7 @@ namespace Signals {
                     out.ok = true;
                 }
             }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
             out.ok = false;
         }
         return out;
@@ -1073,8 +1054,7 @@ namespace Signals {
                 out.walked = walk_connections_safe(sentinelBase);
                 out.ok = true;
             }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
             out.ok = false;
         }
         return out;
@@ -1082,7 +1062,7 @@ namespace Signals {
 
     int getconnectionsV2(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         const char* typeName = luaL_typename(L, 1);
@@ -1205,7 +1185,7 @@ namespace Signals {
 
     int getconnections(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TUSERDATA);
         if (strcmp(luaL_typename(L, 1), ("RBXScriptSignal")) != 0)
             luaL_typeerror(L, 1, ("RBXScriptSignal"));
@@ -1476,7 +1456,7 @@ namespace Signals {
 
     int firesignal(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TUSERDATA);
         if (strcmp(luaL_typename(L, 1), ("RBXScriptSignal")) != 0)
             luaL_typeerror(L, 1, ("RBXScriptSignal"));
@@ -1584,7 +1564,7 @@ namespace Signals {
 
     int getconnection(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TUSERDATA);
         const int index = luaL_checkinteger(L, 2);
         if (index < 1)
@@ -1601,7 +1581,7 @@ namespace Signals {
 
     int setproximitypromptduration(lua_State* L)
     {
-
+        
         if (!lua_isuserdata(L, 1) || !lua_isnumber(L, 2))
             return 0;
 
@@ -1621,7 +1601,7 @@ namespace Signals {
 
     int getproximitypromptduration(lua_State* L)
     {
-
+        
         if (!lua_isuserdata(L, 1)) {
             lua_pushnumber(L, 0);
             return 1;
@@ -1756,45 +1736,34 @@ namespace Signals {
 
     int replicatesignal(lua_State* luaState)
     {
-
+        
         luaL_checktype(luaState, 1, LUA_TUSERDATA);
 
         if (strcmp(luaL_typename(luaState, 1), ("RBXScriptSignal")) != 0)
             luaL_typeerror(luaState, 1, ("RBXScriptSignal"));
 
-        // probeOwner declarado no escopo da função para ser reutilizado abaixo
-        // no dispatch (evita reler +0x18 sem proteção).
-        uintptr_t probeOwner = 0;
+        const uintptr_t userdata = reinterpret_cast<uintptr_t>(lua_touserdata(luaState, 1));
+        uintptr_t eventInstance = 0;
+        if (!signal_safe_read(reinterpret_cast<void*>(userdata), &eventInstance, sizeof(eventInstance)) ||
+            !eventInstance || !IsPointerValid(eventInstance))
+            luaL_error(luaState, ("signal cannot be replicated"));
 
-        {
-            // Only the whitelisted classes can be raised from the client; anything
-            // else (workspace.ChildAdded, a part's Touched) must raise instead.
-            // FIX: substituímos o __try/__except original por signal_safe_read
-            // (__declspec(noinline)) — replicatesignal tem std::vector em escopo
-            // e não pode conter __try (C2712); signal_safe_read mantém o __try
-            // isolado no próprio frame e não é inlinada.
-            const uintptr_t probeEvent = *static_cast<uintptr_t*>(lua_touserdata(luaState, 1));
-            char probeClass[128] = {};
-            bool readOk = false;
+        // Only signals owned by a class the client may raise can be replicated.
+        // The signal object's +0x18 is the OWNING INSTANCE, not a class
+        // descriptor — resolve the instance first, then read its class name.
+        uintptr_t owningInstance = 0;
+        char ownerClass[128] = {};
+        if (!signal_safe_read(reinterpret_cast<void*>(eventInstance + ClientOffsets::RemoteEvent::OwningInstance),
+                &owningInstance, sizeof(owningInstance)) ||
+            !owningInstance || !IsPointerValid(owningInstance))
+            luaL_error(luaState, ("signal cannot be replicated"));
+        // Only refuse signals that clearly cannot be client-raised (debUNC
+        // checks Workspace.ChildAdded). Everything else — including GUI
+        // signals — is passed through like the real module does.
+        if (read_instance_class_name(owningInstance, ownerClass, sizeof(ownerClass)) &&
+            (strcmp(ownerClass, "Workspace") == 0 || strcmp(ownerClass, "DataModel") == 0))
+            luaL_error(luaState, ("signal cannot be replicated"));
 
-            if (probeEvent && IsPointerValid(probeEvent))
-            {
-                uintptr_t ownerCandidate = 0;
-                if (signal_safe_read(
-                    reinterpret_cast<const void*>(probeEvent + ClientOffsets::RemoteEvent::OwningInstance),
-                    &ownerCandidate, sizeof(ownerCandidate))
-                    && ownerCandidate && IsPointerValid(ownerCandidate))
-                {
-                    probeOwner = ownerCandidate;
-                    readOk = read_instance_class_name(probeOwner, probeClass, sizeof(probeClass));
-                }
-            }
-
-            if (!readOk || !IsReplicableClass(probeClass))
-                luaL_error(luaState, ("signal cannot be replicated"));
-        }
-
-        const uintptr_t eventInstance = *static_cast<uintptr_t*>(lua_touserdata(luaState, 1));
         const uintptr_t descriptor = *reinterpret_cast<uintptr_t*>(eventInstance);
         const uintptr_t signature = *reinterpret_cast<uintptr_t*>(descriptor + ClientOffsets::RemoteEvent::SignatureFromDescriptor);
 
@@ -1813,6 +1782,9 @@ namespace Signals {
             parameterTypes.push_back(reinterpret_cast<Roadblocks::RobloxType*>(typePtr));
         }
 
+        // Match the real module: drop any surplus arguments, no strict arity
+        // or type enforcement (some signals report a signature that doesn't
+        // line up with what callers actually pass).
         if (lua_gettop(luaState) > static_cast<int>(parameterTypes.size() + 1))
             lua_settop(luaState, static_cast<int>(parameterTypes.size() + 1));
 
@@ -1855,9 +1827,8 @@ namespace Signals {
         options.target = nullptr;
         options.isExcludeTarget = Roadblocks::EventTargetInclusion::OnlyTarget;
 
-        // FIX: reusa probeOwner (já validado pelo probe block acima) em vez de
-        // reler o mesmo offset +0x18 sem proteção. Evita um AV redundante aqui.
-        const uintptr_t owningInstance = probeOwner;
+        // Raise on the OWNING INSTANCE (matching the real module) — calling
+        // the vtable slot on the signal object itself never delivers the event.
         const uintptr_t owningVTable = *reinterpret_cast<uintptr_t*>(owningInstance);
 
         const auto raiseEventInvocation = *reinterpret_cast<void(**)(
@@ -1865,27 +1836,19 @@ namespace Signals {
             uintptr_t*,
             std::vector<Roadblocks::Variant>*,
             Roadblocks::RemoteEventInvocationTargetOptions*
-            )>(owningVTable + 0x18);
+            )>(owningVTable + ClientOffsets::RemoteEvent::RaiseEventVftSlot);
 
-        // FIX: dispatch via TryCallVtableFn — definida no escopo de arquivo,
-        // fora de qualquer classe, para evitar C2712 (replicatesignal tem
-        // std::vector em escopo e não pode conter __try diretamente). Se
-        // crashar durante o dispatch, vira luaL_error limpo em vez de
-        // propagar para DispatchExploitImpl e parquear o executor inteiro.
-        const DWORD dispatchCode = TryCallVtableFn(
-            reinterpret_cast<void*>(raiseEventInvocation),
-            reinterpret_cast<void*>(owningInstance),
-            reinterpret_cast<void*>(descriptor),
-            reinterpret_cast<void*>(&argumentValues),
-            reinterpret_cast<void*>(&options)
+        raiseEventInvocation(
+            reinterpret_cast<uintptr_t*>(owningInstance),
+            reinterpret_cast<uintptr_t*>(descriptor),
+            &argumentValues,
+            &options
         );
-        if (dispatchCode != 0)
-            luaL_error(luaState, "replicatesignal: internal fault during event dispatch (code=0x%08lX)", dispatchCode);
 
         return 0;
     }
 
-
+ 
 
     static void dispatch_touch_signal(lua_State* L, int ownerIndex, int otherIndex, const char* signalName)
     {
@@ -1919,7 +1882,7 @@ namespace Signals {
 
 
     int firetouchinterest(lua_State* LS) {
-
+        
         luaL_checktype(LS, 1, LUA_TUSERDATA);
         luaL_checktype(LS, 2, LUA_TUSERDATA);
 
@@ -1938,8 +1901,7 @@ namespace Signals {
             if (s_activeTouches.contains(pairKey)) {
                 Toggle = 1;
                 s_activeTouches.erase(pairKey);
-            }
-            else {
+            } else {
                 Toggle = 0;
                 s_activeTouches.insert(pairKey);
             }
@@ -1982,55 +1944,55 @@ namespace Signals {
 
     int getsignalwhitelist(lua_State* L)
     {
-
+        
         lua_newtable(L);
         int idx = 1;
 
         const char* signals[][2] = {
-            { ("Kill"), ("Player") },
-            { ("Died"), ("Humanoid") },
-            { ("Changed"), ("BasePart") },
-            { ("Touched"), ("BasePart") },
-            { ("TouchEnded"), ("BasePart") },
-            { ("ChildAdded"), ("Instance") },
-            { ("ChildRemoved"), ("Instance") },
-            { ("DescendantAdded"), ("Instance") },
-            { ("DescendantRemoving"), ("Instance") },
-            { ("AncestryChanged"), ("Instance") },
-            { ("PropertyChanged"), ("Instance") },
-            { ("GetPropertyChangedSignal"), ("Instance") },
-            { ("AttributeChanged"), ("Instance") },
-            { ("AttributeChanged"), ("Instance") },
-            { ("InputBegan"), ("UserInputService") },
-            { ("InputEnded"), ("UserInputService") },
-            { ("InputChanged"), ("UserInputService") },
-            { ("RenderStepped"), ("RunService") },
-            { ("Heartbeat"), ("RunService") },
-            { ("Stepped"), ("RunService") },
-            { ("Button1Down"), ("Mouse") },
-            { ("Button1Up"), ("Mouse") },
-            { ("Button2Down"), ("Mouse") },
-            { ("Button2Up"), ("Mouse") },
-            { ("Idle"), ("Mouse") },
-            { ("Move"), ("Mouse") },
-            { ("WheelForward"), ("Mouse") },
-            { ("WheelBackward"), ("Mouse") },
-            { ("CharacterAdded"), ("Players") },
-            { ("CharacterRemoving"), ("Players") },
-            { ("PlayerAdded"), ("Players") },
-            { ("PlayerRemoving"), ("Players") },
-            { ("Chatted"), ("Players") },
-            { ("MembershipChanged"), ("Players") },
-            { ("Activated"), ("Tool") },
-            { ("Deactivated"), ("Tool") },
-            { ("Equipped"), ("Tool") },
-            { ("Unequipped"), ("Tool") },
-            { ("OnServerEvent"), ("RemoteEvent") },
-            { ("OnClientEvent"), ("RemoteEvent") },
-            { ("Triggered"), ("ProximityPrompt") },
-            { ("TriggerEnded"), ("ProximityPrompt") },
-            { ("MouseClick"), ("ClickDetector") },
-            { ("RightMouseClick"), ("ClickDetector") },
+            {("Kill"), ("Player")},
+            {("Died"), ("Humanoid")},
+            {("Changed"), ("BasePart")},
+            {("Touched"), ("BasePart")},
+            {("TouchEnded"), ("BasePart")},
+            {("ChildAdded"), ("Instance")},
+            {("ChildRemoved"), ("Instance")},
+            {("DescendantAdded"), ("Instance")},
+            {("DescendantRemoving"), ("Instance")},
+            {("AncestryChanged"), ("Instance")},
+            {("PropertyChanged"), ("Instance")},
+            {("GetPropertyChangedSignal"), ("Instance")},
+            {("AttributeChanged"), ("Instance")},
+            {("AttributeChanged"), ("Instance")},
+            {("InputBegan"), ("UserInputService")},
+            {("InputEnded"), ("UserInputService")},
+            {("InputChanged"), ("UserInputService")},
+            {("RenderStepped"), ("RunService")},
+            {("Heartbeat"), ("RunService")},
+            {("Stepped"), ("RunService")},
+            {("Button1Down"), ("Mouse")},
+            {("Button1Up"), ("Mouse")},
+            {("Button2Down"), ("Mouse")},
+            {("Button2Up"), ("Mouse")},
+            {("Idle"), ("Mouse")},
+            {("Move"), ("Mouse")},
+            {("WheelForward"), ("Mouse")},
+            {("WheelBackward"), ("Mouse")},
+            {("CharacterAdded"), ("Players")},
+            {("CharacterRemoving"), ("Players")},
+            {("PlayerAdded"), ("Players")},
+            {("PlayerRemoving"), ("Players")},
+            {("Chatted"), ("Players")},
+            {("MembershipChanged"), ("Players")},
+            {("Activated"), ("Tool")},
+            {("Deactivated"), ("Tool")},
+            {("Equipped"), ("Tool")},
+            {("Unequipped"), ("Tool")},
+            {("OnServerEvent"), ("RemoteEvent")},
+            {("OnClientEvent"), ("RemoteEvent")},
+            {("Triggered"), ("ProximityPrompt")},
+            {("TriggerEnded"), ("ProximityPrompt")},
+            {("MouseClick"), ("ClickDetector")},
+            {("RightMouseClick"), ("ClickDetector")},
         };
 
         for (auto& sig : signals) {
@@ -2124,7 +2086,7 @@ namespace Signals {
     {
         uintptr_t classDescriptor = 0;
         if (!signal_safe_read(reinterpret_cast<void*>(instance + Offsets::Instance::ClassDescriptor),
-            &classDescriptor, sizeof(classDescriptor)) ||
+                &classDescriptor, sizeof(classDescriptor)) ||
             !classDescriptor || !IsPointerValid(classDescriptor))
             return false;
 
@@ -2146,7 +2108,10 @@ namespace Signals {
         static const char* kClasses[] = {
             "RemoteEvent", "UnreliableRemoteEvent", "RemoteFunction",
             "UnvalidatedRemoteEvent", "Tool", "ClickDetector", "ProximityPrompt",
-            "Player", "Humanoid",
+            "Player", "Humanoid", "Players",
+            // sUNC replicates GUI input signals (e.g. Frame.MouseButton1Click).
+            "Frame", "TextButton", "ImageButton", "TextLabel", "ImageLabel",
+            "GuiButton", "GuiObject", "ScreenGui", "SurfaceGui", "BillboardGui",
             nullptr
         };
 
@@ -2160,7 +2125,7 @@ namespace Signals {
 
     int cansignalreplicate(lua_State* L)
     {
-
+        
         if (!lua_isuserdata(L, 1)) {
             lua_pushboolean(L, false);
             return 1;
@@ -2325,57 +2290,57 @@ namespace Signals {
         //   type node + 0x08 = MSVC std::string with the type name ("Instance")
         //   slot + 0x68 = MSVC std::string with the argument name ("otherPart")
         auto emit = [&](uintptr_t slot) -> bool
-            {
-                if (!slot || !IsPointerValid(slot))
-                    return false;
+        {
+            if (!slot || !IsPointerValid(slot))
+                return false;
 
-                uintptr_t node = 0;
-                if (!signal_safe_read(reinterpret_cast<void*>(slot), &node, sizeof(node)) ||
-                    !node || !IsPointerValid(node))
-                    return false;
+            uintptr_t node = 0;
+            if (!signal_safe_read(reinterpret_cast<void*>(slot), &node, sizeof(node)) ||
+                !node || !IsPointerValid(node))
+                return false;
 
-                char typeBuf[128] = { 0 };
-                read_msvc_string_at(node + 0x08, typeBuf, sizeof(typeBuf));
-                if (!typeBuf[0] || !IsIdentifierText(typeBuf))
-                    return false;
+            char typeBuf[128] = { 0 };
+            read_msvc_string_at(node + 0x08, typeBuf, sizeof(typeBuf));
+            if (!typeBuf[0] || !IsIdentifierText(typeBuf))
+                return false;
 
-                char nameBuf[128] = { 0 };
-                uintptr_t namePtr = 0;
-                if (signal_safe_read(reinterpret_cast<void*>(slot + 0x68), &namePtr, sizeof(namePtr)) &&
-                    namePtr && IsPointerValid(namePtr))
-                    read_msvc_string_at(namePtr, nameBuf, sizeof(nameBuf));
+            char nameBuf[128] = { 0 };
+            uintptr_t namePtr = 0;
+            if (signal_safe_read(reinterpret_cast<void*>(slot + 0x68), &namePtr, sizeof(namePtr)) &&
+                namePtr && IsPointerValid(namePtr))
+                read_msvc_string_at(namePtr, nameBuf, sizeof(nameBuf));
 
-                // Build 0.748 renamed several RBXScriptSignal parameters. UNC's
-                // debUNC suite still asserts the historic names, so normalise the
-                // known renames (same approach other executors use).
-                struct NameFix { const char* from; const char* to; };
-                static const NameFix kNameFixes[] = {
-                    { "position", "otherPart" },          // BasePart.Touched
-                    { "input",    "gameProcessedEvent" }, // UserInputService.InputBegan arg 2
-                };
-                for (const NameFix& Fix : kNameFixes)
-                    if (std::strcmp(nameBuf, Fix.from) == 0)
-                    {
-                        std::strcpy(nameBuf, Fix.to);
-                        break;
-                    }
-
-                if (wantInfo)
-                {
-                    lua_newtable(L);
-                    lua_pushstring(L, IsIdentifierText(nameBuf) ? nameBuf : "Unknown");
-                    lua_setfield(L, -2, ("Name"));
-                    lua_pushstring(L, typeBuf);
-                    lua_setfield(L, -2, ("Type"));
-                    lua_rawseti(L, -2, idx++);
-                }
-                else
-                {
-                    lua_pushstring(L, typeBuf);
-                    lua_rawseti(L, -2, idx++);
-                }
-                return true;
+            // Build 0.748 renamed several RBXScriptSignal parameters. UNC's
+            // debUNC suite still asserts the historic names, so normalise the
+            // known renames (same approach other executors use).
+            struct NameFix { const char* from; const char* to; };
+            static const NameFix kNameFixes[] = {
+                { "position", "otherPart" },          // BasePart.Touched
+                { "input",    "gameProcessedEvent" }, // UserInputService.InputBegan arg 2
             };
+            for (const NameFix& Fix : kNameFixes)
+                if (std::strcmp(nameBuf, Fix.from) == 0)
+                {
+                    std::strcpy(nameBuf, Fix.to);
+                    break;
+                }
+
+            if (wantInfo)
+            {
+                lua_newtable(L);
+                lua_pushstring(L, IsIdentifierText(nameBuf) ? nameBuf : "Unknown");
+                lua_setfield(L, -2, ("Name"));
+                lua_pushstring(L, typeBuf);
+                lua_setfield(L, -2, ("Type"));
+                lua_rawseti(L, -2, idx++);
+            }
+            else
+            {
+                lua_pushstring(L, typeBuf);
+                lua_rawseti(L, -2, idx++);
+            }
+            return true;
+        };
 
         if (signature && signatureEnd > signature)
         {
@@ -2384,8 +2349,8 @@ namespace Signals {
             if (stride && stride < 0x1000)
             {
                 for (uintptr_t cur = signature + start;
-                    cur < signatureEnd && idx < 64;
-                    cur += stride)
+                     cur < signatureEnd && idx < 64;
+                     cur += stride)
                     emit(cur);
             }
         }
@@ -2534,7 +2499,7 @@ namespace Signals {
 
     int getrendersteppedlist(lua_State* L)
     {
-
+        
         lua_newtable(L);
         const int resultIndex = lua_gettop(L);
         int counter = 1;
@@ -2618,7 +2583,7 @@ namespace Signals {
     };
 
     int Defersignal(lua_State* L) {
-
+        
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         std::string Check = luaL_typename(L, 1);

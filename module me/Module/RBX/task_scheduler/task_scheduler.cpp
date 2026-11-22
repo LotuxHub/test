@@ -16,6 +16,7 @@
 #include <RBX/environment/libs/signals/signals.hpp>
 #include <RBX/environment/libs/reflection/reflection.hpp>
 #include <RBX/environment/libs/oth/oth.hpp>
+#include <RBX/environment/libs/actor/actor.hpp>
 #include <RBX/diagnostics.hpp>
 #include <Renderer/Renderer.hpp>
 #include <RBX/environment/env.hpp>
@@ -40,10 +41,6 @@
 #include <imgui/imgui_internal.h>
 namespace
 {
-
-	bool s_GameLoaded = false;
-	int  s_GameLoadedFrames = 0;
-	std::chrono::steady_clock::time_point s_GameLoadedDeadline{};
 	thread_local std::string LastSchedulerError;
 	thread_local const char* InitializationPhase = "not started";
 
@@ -281,21 +278,21 @@ inline bool CheckMemory(uintptr_t address) {
 
 inline lua_State* GetLuaStateForInstance(uintptr_t sc)
 {
-	if (!sc) return nullptr;
-	__try
-	{
-		*reinterpret_cast<BOOLEAN*>(sc + Offsets::ExtraSpace::RequireBypass) = TRUE;
-		uintptr_t identity = 2;
-		uintptr_t script = 0;
-		lua_State* state = Roblox::GetLuaStateForInstance(sc, &identity, &script);
-		if (!state || !CheckMemory(reinterpret_cast<uintptr_t>(state)) || state->tt != LUA_TTHREAD || !state->global)
-			return nullptr;
-		return state;
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		return nullptr;
-	}
+    if (!sc) return nullptr;
+    __try
+    {
+        *reinterpret_cast<BOOLEAN*>(sc + Offsets::ExtraSpace::RequireBypass) = TRUE;
+        uintptr_t identity = 2;
+        uintptr_t script = 0;
+        lua_State* state = Roblox::GetLuaStateForInstance(sc, &identity, &script);
+        if (!state || !CheckMemory(reinterpret_cast<uintptr_t>(state)) || state->tt != LUA_TTHREAD || !state->global)
+            return nullptr;
+        return state;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
 }
 
 lua_State* task_scheduler::GetLuaState(uintptr_t ScriptContext, uintptr_t Identity, uintptr_t Script)
@@ -380,9 +377,6 @@ void Reset()
 	Shared::JobStepLocked = true;
 	Shared::IsInitializedOnGame = false;
 	g_PartialInit = false;
-	s_GameLoaded = false;
-	s_GameLoadedFrames = 0;
-	s_GameLoadedDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	Shared::StateGeneration.fetch_add(1);
 
 	std::lock_guard<std::mutex> stepLock(g_StepHookMutex);
@@ -831,74 +825,14 @@ static bool InitializeGame()
 	}
 }
 
-// ── Non-blocking game.Loaded gate ────────────────────────────────────────────
-// __try cannot coexist with C++ objects that have destructors (MSVC C2712),
-// so the SEH check lives in its own plain function with no such objects.
-// Returns true if game is loaded (or if we should give up waiting).
-static bool CheckGameLoadedSEH(lua_State* L)
-{
-	bool Loaded = false;
-	__try
-	{
-		const int Top = lua_gettop(L);
-		lua_getglobal(L, "game");
-		if (lua_type(L, -1) == LUA_TUSERDATA || lua_type(L, -1) == LUA_TTABLE)
-		{
-			lua_getfield(L, -1, "IsLoaded");
-			if (lua_type(L, -1) == LUA_TFUNCTION)
-			{
-				lua_pushvalue(L, -2); // self
-				if (lua_pcall(L, 1, 1, 0) == LUA_OK)
-					Loaded = lua_toboolean(L, -1) != 0;
-			}
-		}
-		lua_settop(L, Top);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		lua_settop(L, 0);
-		Loaded = true; // fault → don't block forever
-	}
-	return Loaded;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-
 static bool ExecuteGameImpl()
 {
+    // Periodic: log any object named/ClassName'd "Actor" in the game tree.
+    Actor::ScanForActorScripts();
 	// Partial init stages park the executor entirely: queued scripts, drawing,
 	// RakNet and yields all need the fully built environment.
 	if (g_PartialInit || g_InitStage < kFullInitStage || !Shared::ExploitThread)
 		return true;
-
-	// ── Non-blocking game.Loaded gate ────────────────────────────────────────
-// Deadline em tempo real (30 s), não em frames: durante o loading o FPS
-// cai pra ~10 e um cap de 600 frames virava 60 s de espera.
-	if (!s_GameLoaded)
-	{
-		++s_GameLoadedFrames;
-		const bool Loaded = CheckGameLoadedSEH(Shared::ExploitThread);
-		const bool TimedOut = std::chrono::steady_clock::now() >= s_GameLoadedDeadline;
-
-		if (Loaded || TimedOut)
-		{
-			s_GameLoaded = true;
-			LOGF("TaskScheduler", "game.Loaded gate lifted (frames=%d loaded=%d timedout=%d)",
-				s_GameLoadedFrames, (int)Loaded, (int)TimedOut);
-		}
-		else
-		{
-			DrawingImmediate::Render(Shared::ExploitThread);
-			Yielding::RunYield();
-			return true;
-		}
-	}
-	// ─────────────────────────────────────────────────────────────────────────
-
-	// Marca o início do trabalho do step para o log de duração ao final
-	// (compilação + dispatch + render + yields + RakNet juntos).
-	const auto StepStart = std::chrono::steady_clock::now();
-	constexpr auto kStepBudget = std::chrono::milliseconds(8);
 
 	std::vector<std::string> Pending;
 
@@ -919,79 +853,28 @@ static bool ExecuteGameImpl()
 
 	// Taking one script per step made every queued execution cost a frame, so a
 	// batch of N scripts took N frames before the last one even loaded.
-	// Orçamento de ~8 ms: um lote de scripts grandes compilados e despachados
-	// todos juntos virava um único frame gigante (o jogo "trava" uma vez por
-	// lote). O que exceder o orçamento volta para a fila e roda no próximo step.
-	size_t ExecutedCount = 0;
-	size_t ScriptIndex = 0;
-	for (; ScriptIndex < Pending.size(); ++ScriptIndex)
+	for (std::string& Script : Pending)
 	{
-		std::string& Script = Pending[ScriptIndex];
-		if (Script.empty())
-			continue;
-
-		Diagnostics::SetStage("dispatch: ExecuteScript");
-		Execution::ExecuteScript(Shared::ExploitThread, std::move(Script));
-		++ExecutedCount;
-
-		if (std::chrono::steady_clock::now() - StepStart >= kStepBudget)
-			break;
-	}
-
-	if (ScriptIndex < Pending.size())
-	{
-		// Re-enfileira o restante na frente, preservando a ordem original
-		// (iterando de trás pra frente e inserindo no begin).
-		size_t Deferred = 0;
+		if (!Script.empty())
 		{
-			std::lock_guard<std::mutex> lock(Shared::ExecutionRequestsMutex);
-			for (size_t i = Pending.size(); i-- > ScriptIndex + 1; )
-			{
-				if (Pending[i].empty())
-					continue;
-				Shared::ExecutionRequests.insert(Shared::ExecutionRequests.begin(), std::move(Pending[i]));
-				++Deferred;
-			}
+			Diagnostics::SetStage("dispatch: ExecuteScript");
+			Execution::ExecuteScript(Shared::ExploitThread, std::move(Script));
 		}
-		if (Deferred)
-			LOGF("TaskScheduler", "Step budget: executed %zu script(s), deferred %zu to next step",
-				ExecutedCount, Deferred);
 	}
-
-	// ── Per-frame overhead throttle ───────────────────────────────────────────
-	// DrawingImmediate and Yielding run every step (must be low-latency).
-	// Raknet DiagScan and ProcessCallbacks run on a reduced cadence so they
-	// don't eat a full scheduler slice on every 60 Hz frame.
-	//   DiagScan    — every 6 steps  (~10 Hz at 60 fps, read-only inspection)
-	//   Callbacks   — every 3 steps  (~20 Hz at 60 fps, adequate for user code)
-	static uint32_t s_StepCounter = 0;
-	++s_StepCounter;
 
 	Diagnostics::SetStage("dispatch: DrawingImmediate::Render");
 	DrawingImmediate::Render(Shared::ExploitThread);
-
-	Diagnostics::SetStage("dispatch: Yielding::RunYield");
-	Yielding::RunYield();
-
 	if (!Raknet::hooked)
 	{
 		if (uintptr_t peerJob = task_scheduler::GetJobByTypeName(ClientOffsets::RakNet::JobNameSend, 0))
 			Raknet::InitializeHook(peerJob);
 	}
-	else
-	{
-		if ((s_StepCounter % 6) == 0)
-		{
-			Diagnostics::SetStage("dispatch: Raknet::DiagScan");
-			Raknet::DiagScan(Shared::ExploitThread, task_scheduler::GetJobByTypeName(ClientOffsets::RakNet::JobNameRecv, 0));
-		}
-		if ((s_StepCounter % 3) == 0)
-		{
-			Diagnostics::SetStage("dispatch: Raknet::ProcessCallbacks");
-			Raknet::ProcessCallbacks(Shared::ExploitThread);
-		}
-	}
-	// ─────────────────────────────────────────────────────────────────────────
+	Diagnostics::SetStage("dispatch: Raknet::DiagScan");
+	Raknet::DiagScan(Shared::ExploitThread, task_scheduler::GetJobByTypeName(ClientOffsets::RakNet::JobNameRecv, 0));
+	Diagnostics::SetStage("dispatch: Raknet::ProcessCallbacks");
+	Raknet::ProcessCallbacks(Shared::ExploitThread);
+	Diagnostics::SetStage("dispatch: Yielding::RunYield");
+	Yielding::RunYield();
 
 	if (g_SelfTestState == 1 && Shared::ExploitThread)
 	{
@@ -1016,17 +899,6 @@ static bool ExecuteGameImpl()
 			g_SelfTestState = 3;
 			LOGF("TaskScheduler", "Self-test FAILED: marker still missing after %d steps", g_SelfTestSteps);
 		}
-	}
-
-	// Step lento demais (>8 ms de trabalho nosso) é exatamente o sintoma de
-	// lag na execução — registrar com a stage ajuda a localizar qual parte
-	// (compile, dispatch, render, yield ou RakNet) estourou o orçamento.
-	{
-		const auto StepUs = std::chrono::duration_cast<std::chrono::microseconds>(
-			std::chrono::steady_clock::now() - StepStart).count();
-		if (StepUs > 8000)
-			LOGF("TaskScheduler", "Step work took %lld us (scripts=%zu stage='%s')",
-				static_cast<long long>(StepUs), ExecutedCount, Diagnostics::GetStage());
 	}
 
 	Diagnostics::SetStage("dispatch: idle");
@@ -1097,40 +969,6 @@ static uintptr_t stepHook(uintptr_t Job, uintptr_t Stats)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════════════════════
-// SEH helpers — sem objetos C++ com destrutor → __try permitido com /EHa.
-// Usados por TeleportHandler para guardar chamadas que podem dar AV quando
-// o processo do jogo está sendo encerrado e a memória do scheduler já foi
-// liberada.
-// ══════════════════════════════════════════════════════════════════════════════
-
-// Chama GetDataModel() dentro de __try. Retorna false se houve AV.
-static bool TrySafeGetDataModel(uintptr_t* out) noexcept
-{
-	__try
-	{
-		*out = task_scheduler::GetDataModel();
-		return true;
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		return false;
-	}
-}
-
-// Chama IsGameLoaded() dentro de __try. Retorna false se houve AV.
-static bool TrySafeIsGameLoaded(uintptr_t dataModel) noexcept
-{
-	__try
-	{
-		return IsGameLoaded(dataModel);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		return false;
-	}
-}
-
 // TeleportHandler — WHSJ vtable hook & DataModel lifecycle
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -1138,42 +976,15 @@ void task_scheduler::TeleportHandler()
 {
 	constexpr size_t kJobVtableSlots = 9;
 
-	// Passagem antecipada do espelho de FFlags: o custo (~minutos caminhando o
-	// registry do cliente) não depende do DataModel, então roda aqui no início
-	// da thread, se sobrepondo ao próprio loading do jogo. O guard atômico
-	// dentro de SyncClientLuauFlags() faz a chamada abaixo (antes da vtable) e
-	// a da game thread virarem no-ops — a game thread nunca paga este custo.
-	{
-		const auto SyncStart = std::chrono::steady_clock::now();
-		SyncClientLuauFlags(true);
-		LOGF("TaskScheduler", "FFlag mirror startup pass took %lld ms",
-			static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-				std::chrono::steady_clock::now() - SyncStart).count()));
-	}
-
 	while (true)
 	{
 		LOGF("TaskScheduler", "Waiting for a loaded DataModel");
 		Shared::IsInitializedOnGame = false;
 
-		// FIX: usa helper SEH — TeleportHandler tem objetos C++ (LOGF, etc.) e
-		// não pode conter __try diretamente (C2712). Os helpers isolam o __try
-		// em funções noexcept sem objetos com destrutor.
-		uintptr_t DataModel = 0;
-		if (!TrySafeGetDataModel(&DataModel))
-		{
-			LOGF("TaskScheduler", "TeleportHandler: AV on GetDataModel, process is likely exiting");
-			return;
-		}
-
-		while (!TrySafeIsGameLoaded(DataModel))
-		{
+		uintptr_t DataModel = task_scheduler::GetDataModel();
+		while (!IsGameLoaded(DataModel)) {
 			Sleep(100);
-			if (!TrySafeGetDataModel(&DataModel))
-			{
-				LOGF("TaskScheduler", "TeleportHandler: AV on GetDataModel (wait loop), process is likely exiting");
-				return;
-			}
+			DataModel = task_scheduler::GetDataModel();
 		}
 
 		Shared::LastDataModel = DataModel;
@@ -1181,8 +992,7 @@ void task_scheduler::TeleportHandler()
 		uintptr_t GameWHSJ = 0;
 		LOGF("TaskScheduler", "Loaded DataModel=%p; waiting for hybrid script job", reinterpret_cast<void*>(Shared::LastDataModel));
 		while (!(GameWHSJ = task_scheduler::GetJobByTypeName("WaitingHybridScriptsJob", Shared::LastDataModel))) {
-			uintptr_t curDm = 0;
-			if (!TrySafeGetDataModel(&curDm) || curDm != Shared::LastDataModel || !TrySafeIsGameLoaded(Shared::LastDataModel))
+			if (task_scheduler::GetDataModel() != Shared::LastDataModel || !IsGameLoaded(Shared::LastDataModel))
 				break;
 			Sleep(50);
 		}
@@ -1196,16 +1006,6 @@ void task_scheduler::TeleportHandler()
 
 		Shared::LastWaitingHybridScriptsJob = GameWHSJ;
 		LOGF("TaskScheduler", "Hybrid script job=%p", reinterpret_cast<void*>(GameWHSJ));
-
-		// === NOVO ===
-		// Sincroniza os FFlags do cliente AQUI, na thread de fundo, antes de
-		// instalar a vtable. Sem isso, o custo (~1-2 min caminhando o registry
-		// de FFlags do cliente) caía inteiro dentro de InitializeGame() na
-		// game thread, congelando o jogo na primeira entrada. O guard atômico
-		// dentro da função garante que a chamada vinda de InitializeGameImpl()
-		// retorne imediatamente.
-		SyncClientLuauFlags();
-		// === FIM NOVO ===
 
 		const auto jobVFtable = *reinterpret_cast<uintptr_t**>(Shared::LastWaitingHybridScriptsJob);
 		if (Shared::HybridJobVtable == nullptr || Shared::OriginalHybridJobVtable != jobVFtable)
@@ -1233,15 +1033,9 @@ void task_scheduler::TeleportHandler()
 
 		while (true)
 		{
-			uintptr_t currentDatamodel = 0;
-			if (!TrySafeGetDataModel(&currentDatamodel))
-			{
-				LOGF("TaskScheduler", "TeleportHandler: AV in monitor loop, process is likely exiting");
-				Reset();
-				return;
-			}
+			uintptr_t currentDatamodel = task_scheduler::GetDataModel();
 
-			if (currentDatamodel != Shared::LastDataModel || !TrySafeIsGameLoaded(currentDatamodel)) {
+			if (currentDatamodel != Shared::LastDataModel || !IsGameLoaded(currentDatamodel)) {
 				LOGF("TaskScheduler", "DataModel changed/left (old=%p new=%p); resetting",
 					reinterpret_cast<void*>(Shared::LastDataModel),
 					reinterpret_cast<void*>(currentDatamodel));
@@ -1273,77 +1067,77 @@ void task_scheduler::RequestExecution(std::string Script)
 
 uintptr_t task_scheduler::GetJobByTypeName(const std::string& TypeName, uintptr_t DataModel)
 {
-	__try
+    __try
+    {
+	uintptr_t task_scheduler =
+		*reinterpret_cast<uintptr_t*>(
+			Offsets::Scheduler::TaskScheduler
+			);
+
+	if (!task_scheduler)
+		return 0;
+
+	uintptr_t JobsStart =
+		*reinterpret_cast<uintptr_t*>(
+			task_scheduler + Offsets::Scheduler::JobStart
+			);
+
+	uintptr_t JobsEnd =
+		*reinterpret_cast<uintptr_t*>(
+			task_scheduler + Offsets::Scheduler::JobEnd
+			);
+
+	if (!JobsStart || !JobsEnd || JobsStart >= JobsEnd ||
+		(JobsEnd - JobsStart) % 0x10 != 0 || (JobsEnd - JobsStart) / 0x10 > 65536)
+		return 0;
+
+	const size_t nameLen = TypeName.size();
+	if (nameLen == 0 || nameLen >= 0x100)
+		return 0;
+
+
+	for (uintptr_t Current = JobsStart;
+		Current < JobsEnd;
+		Current += 0x10)
 	{
-		uintptr_t task_scheduler =
-			*reinterpret_cast<uintptr_t*>(
-				Offsets::Scheduler::TaskScheduler
-				);
+		uintptr_t Job =
+			*reinterpret_cast<uintptr_t*>(Current);
 
-		if (!task_scheduler)
-			return 0;
+		if (!Job)
+			continue;
 
-		uintptr_t JobsStart =
-			*reinterpret_cast<uintptr_t*>(
-				task_scheduler + Offsets::Scheduler::JobStart
-				);
-
-		uintptr_t JobsEnd =
-			*reinterpret_cast<uintptr_t*>(
-				task_scheduler + Offsets::Scheduler::JobEnd
-				);
-
-		if (!JobsStart || !JobsEnd || JobsStart >= JobsEnd ||
-			(JobsEnd - JobsStart) % 0x10 != 0 || (JobsEnd - JobsStart) / 0x10 > 65536)
-			return 0;
-
-		const size_t nameLen = TypeName.size();
-		if (nameLen == 0 || nameLen >= 0x100)
-			return 0;
-
-
-		for (uintptr_t Current = JobsStart;
-			Current < JobsEnd;
-			Current += 0x10)
+		const uintptr_t nameAddress = Job + Offsets::Scheduler::JobTypeName;
+		if (!CheckMemory(nameAddress + 0x18))
+			continue;
+		const size_t size = *reinterpret_cast<const size_t*>(nameAddress + 0x10);
+		const size_t capacity = *reinterpret_cast<const size_t*>(nameAddress + 0x18);
+		if (size != nameLen || capacity < size)
+			continue;
+		const char* candidate = capacity < 16
+			? reinterpret_cast<const char*>(nameAddress)
+			: *reinterpret_cast<const char* const*>(nameAddress);
+		if (candidate && CheckMemory(reinterpret_cast<uintptr_t>(candidate)) &&
+			CheckMemory(reinterpret_cast<uintptr_t>(candidate) + nameLen))
 		{
-			uintptr_t Job =
-				*reinterpret_cast<uintptr_t*>(Current);
-
-			if (!Job)
+			if (memcmp(candidate, TypeName.c_str(), nameLen) != 0)
 				continue;
-
-			const uintptr_t nameAddress = Job + Offsets::Scheduler::JobTypeName;
-			if (!CheckMemory(nameAddress + 0x18))
-				continue;
-			const size_t size = *reinterpret_cast<const size_t*>(nameAddress + 0x10);
-			const size_t capacity = *reinterpret_cast<const size_t*>(nameAddress + 0x18);
-			if (size != nameLen || capacity < size)
-				continue;
-			const char* candidate = capacity < 16
-				? reinterpret_cast<const char*>(nameAddress)
-				: *reinterpret_cast<const char* const*>(nameAddress);
-			if (candidate && CheckMemory(reinterpret_cast<uintptr_t>(candidate)) &&
-				CheckMemory(reinterpret_cast<uintptr_t>(candidate) + nameLen))
+			if (DataModel)
 			{
-				if (memcmp(candidate, TypeName.c_str(), nameLen) != 0)
+				const uintptr_t Context = *reinterpret_cast<uintptr_t*>(Job + ClientOffsets::jobs_offsets::scriptContext);
+				if (!Context || !CheckMemory(Context + ClientOffsets::ScriptContext::DataModel))
 					continue;
-				if (DataModel)
-				{
-					const uintptr_t Context = *reinterpret_cast<uintptr_t*>(Job + ClientOffsets::jobs_offsets::scriptContext);
-					if (!Context || !CheckMemory(Context + ClientOffsets::ScriptContext::DataModel))
-						continue;
-					const uintptr_t Owner = *reinterpret_cast<uintptr_t*>(Context + ClientOffsets::ScriptContext::DataModel);
-					if (Owner != DataModel && Owner + ClientOffsets::DataModel::InstanceSubobject != DataModel)
-						continue;
-				}
-				return Job;
+				const uintptr_t Owner = *reinterpret_cast<uintptr_t*>(Context + ClientOffsets::ScriptContext::DataModel);
+				if (Owner != DataModel && Owner + ClientOffsets::DataModel::InstanceSubobject != DataModel)
+					continue;
 			}
+			return Job;
 		}
+	}
 
-		return 0;
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		return 0;
-	}
+	return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
 }

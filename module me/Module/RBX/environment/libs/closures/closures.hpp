@@ -2,7 +2,6 @@
 #include <string>
 #include <cstdint>
 #include <cstring>
-#include <chrono>
 
 #include <lstate.h>
 #include <ldo.h>
@@ -111,6 +110,7 @@ namespace Closures
     inline void ResetLibraryState()
     {
         HookRecords.clear();
+        HookProtoRecords.clear();
         NewCClosureRefs.clear();
         WrappedClosures.clear();
         LuaHookDispatcherRef = LUA_NOREF;
@@ -427,7 +427,7 @@ namespace Closures
                 const int retained = lua_ref(L, -1);
                 lua_pop(L, 1);
                 return retained;
-                };
+            };
             snapshot.OriginalRef = retain(snapshot.OriginalRef);
             snapshot.HookRef = retain(snapshot.HookRef);
             snapshot.PreserveFrameIdentity = false;
@@ -742,7 +742,7 @@ namespace Closures
 
     static int hookfunction(lua_State* L, int targetIndex, int hookIndex)
     {
-
+        
 
         Closure* target = to_closure(L, targetIndex);
         Closure* hook = to_closure(L, hookIndex);
@@ -930,12 +930,12 @@ namespace Closures
     // replaceclosure globals — target at 1, hook at 2.
     static int hookfunction(lua_State* L)
     {
-
+        
         return hookfunction(L, 1, 2);
     }
     static int restorefunction(lua_State* L)
     {
-
+        
         Closure* target = to_closure(L, 1);
         auto it = HookRecords.find(target);
         if (it == HookRecords.end() || it->second.OriginalRef == LUA_NOREF)
@@ -979,7 +979,12 @@ namespace Closures
             luaL_error(L, ("restorefunction: incompatible closure layout"));
         }
 
+        // Drop the dispatcher-proto routing entry before the proto is replaced;
+        // otherwise its freed address can be reused by an unrelated closure.
+        Proto* hookedProto = (!target->isC && target->l.p) ? target->l.p : nullptr;
         copy_closure_body(L, target, original);
+        if (hookedProto)
+            HookProtoRecords.erase(hookedProto);
         if (target->isC)
         {
             auto originalWrapped = NewCClosureRefs.find(original);
@@ -1012,17 +1017,17 @@ namespace Closures
 
     inline int newcclosure(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TFUNCTION);
 
         Closure* closure = clvalue(index2addr(L, 1));
-
+      
         if (closure->isC) {
-
+           
             lua_pushvalue(L, 1);
             return 1;
         }
-
+  
         for (auto& pair : NewCClosureRefs) {
             if (!pair.second.Reusable)
                 continue;
@@ -1032,31 +1037,31 @@ namespace Closures
             lua_pop(L, 1);
 
             if (same) {
-
+              
                 push_closure(L, pair.first);
                 return 1;
             }
         }
-
+    
         const char* debugname = lua_isstring(L, 2) ? lua_tostring(L, 2) : ("newcclosure");
-
+     
         lua_pushvalue(L, 1);
 
         lua_pushcclosurek(L, NewCClosureDispatcher, debugname, 1, DispatchContinuation);
-
+      
         Closure* wrapper = clvalue(index2addr(L, -1));
-
+ 
         lua_pushvalue(L, 1);
-
+  
         NewCClosureRefs[wrapper] = { lua_ref(L, -1), true };
 
         lua_pop(L, 1);
 
-
+     
         WrappedClosures.insert(wrapper);
-
+     
         wrapper->env = closure->env;
-
+  
         Shared::ExecutorClosures.insert(wrapper);
         Environment->function_array.push_back(wrapper);
         return 1;
@@ -1065,7 +1070,7 @@ namespace Closures
 
     inline int isnewcclosure(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TFUNCTION);
         Closure* closure = clvalue(index2addr(L, 1));
         lua_pushboolean(L, WrappedClosures.count(closure) > 0);
@@ -1081,10 +1086,7 @@ namespace Closures
 
     inline int FinishLoadstring(lua_State* L, const std::string& Bytecode, const char* ChunkName)
     {
-        // Do NOT call lua_setsafeenv on LUA_GLOBALSINDEX here — it marks the
-        // entire thread's global table as unsafe, which corrupts __index caching
-        // for every script on this state and causes random nil reads.
-        // The loaded chunk gets its own env via SetProtoCapabilities instead.
+        lua_setsafeenv(L, LUA_GLOBALSINDEX, false);
         if (luau_load(L, ChunkName, Bytecode.data(), Bytecode.size(), 0) != LUA_OK)
         {
             LOGF("Loadstring", "Load failed: %s", lua_tostring(L, -1));
@@ -1112,30 +1114,16 @@ namespace Closures
         if (sourceLen >= 16384 && lua_isyieldable(L))
         {
             return Yielding::YieldExecution(L, [Source = std::move(Source), ChunkName = std::move(ChunkName)]() mutable -> std::function<int(lua_State*)>
+            {
+                std::string Bytecode = Execution::CompileScript(std::move(Source));
+                return [Bytecode = std::move(Bytecode), ChunkName = std::move(ChunkName)](lua_State* L) -> int
                 {
-                    // Compilação pesada roda no worker (longe da game thread);
-                    // registrar a duração separada do tempo de resume permite ver
-                    // no log quanto custou cada etapa.
-                    const size_t SourceLen = Source.size();
-                    const auto CompileStart = std::chrono::steady_clock::now();
-                    std::string Bytecode = Execution::CompileScript(std::move(Source));
-                    const auto CompileUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - CompileStart).count();
-                    LOGF("Loadstring", "Async compile %zu B -> %zu B in %lld us (worker)",
-                        SourceLen, Bytecode.size(), static_cast<long long>(CompileUs));
-                    return [Bytecode = std::move(Bytecode), ChunkName = std::move(ChunkName)](lua_State* L) -> int
-                        {
-                            return FinishLoadstring(L, Bytecode, ChunkName.c_str());
-                        };
-                });
+                    return FinishLoadstring(L, Bytecode, ChunkName.c_str());
+                };
+            });
         }
 
-        const auto CompileStart = std::chrono::steady_clock::now();
         std::string Bytecode = Execution::CompileScript(std::move(Source));
-        const auto CompileUs = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - CompileStart).count();
-        LOGF("Loadstring", "Sync compile %zu B -> %zu B in %lld us (game thread)",
-            sourceLen, Bytecode.size(), static_cast<long long>(CompileUs));
         return FinishLoadstring(L, Bytecode, ChunkName.c_str());
     }
 
@@ -1374,7 +1362,7 @@ namespace Closures
             {
                 requested = (int)lua_tointeger(L, levelIdx);
                 shiftIt = requested >= 0; // negatives are forwarded, the
-                // original raises on them
+                                          // original raises on them
             }
             // a non-number level is forwarded untouched so db_traceback
             // still produces its own argument error
@@ -1394,7 +1382,7 @@ namespace Closures
             // unshifted default still looked right - explicit levels did not.
             while (lua_gettop(L) < levelIdx)
                 lua_pushnil(L); // fills a missing message slot with nil,
-            // which luaL_optstring treats as absent
+                                // which luaL_optstring treats as absent
             lua_pushinteger(L, requested + (sameThread ? 1 : 0));
             lua_replace(L, levelIdx);
         }
@@ -2007,7 +1995,7 @@ namespace Closures
 
     inline int restoresignal(lua_State* L)
     {
-
+        
         luaL_checkany(L, 1);
 
         void* key = SignalKey(L, 1);
@@ -2038,7 +2026,7 @@ namespace Closures
                     if (lua_isfunction(L, -1))
                     {
                         lua_pushvalue(L, 1);          // [funcs][fn][Connect][self]
-                        lua_pushvalue(L, funcsIdx + 1); // [funcs][fn][Connect][self][fn]
+                        lua_pushvalue(L, funcsIdx+1); // [funcs][fn][Connect][self][fn]
                         if (lua_pcall(L, 2, 0, 0) != LUA_OK)
                             lua_pop(L, 1);
                     }
@@ -2354,7 +2342,7 @@ namespace Closures
 
     inline int iscclosure(lua_State* L)
     {
-
+        
         if (!lua_isfunction(L, 1))
         {
             lua_pushboolean(L, false);
@@ -2366,7 +2354,7 @@ namespace Closures
 
     inline int islclosure(lua_State* L)
     {
-
+        
         if (!lua_isfunction(L, 1))
         {
             lua_pushboolean(L, false);
@@ -2437,7 +2425,7 @@ namespace Closures
 
     inline auto is_executor_closure(lua_State* rl) -> int
     {
-
+        
         if (lua_type(rl, 1) != LUA_TFUNCTION) {
             lua_pushboolean(rl, false);
             return 1;
@@ -2451,7 +2439,7 @@ namespace Closures
 
 
     inline int gettenv(lua_State* L) {
-
+        
         // With no argument the calling thread's environment is returned, which is
         // what getfenv(0) gives. A finished thread still reports its environment.
         lua_State* thread = L;
@@ -2479,10 +2467,10 @@ namespace Closures
         lua_xmove(thread, L, 1);
         return 1;
     }
-
+  
     inline int compareclosures(lua_State* L)
     {
-
+        
         luaL_checktype(L, 1, LUA_TFUNCTION);
         luaL_checktype(L, 2, LUA_TFUNCTION);
 
@@ -2508,7 +2496,7 @@ namespace Closures
 
     inline int setstackhidden(lua_State* L)
     {
-
+        
         luaL_checkany(L, 1);
         const bool hidden = luaL_checkboolean(L, 2) != 0;
 

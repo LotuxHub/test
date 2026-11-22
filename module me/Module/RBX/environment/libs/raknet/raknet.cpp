@@ -1156,6 +1156,92 @@ namespace Raknet
         return 1;
     }
 
+    // Inject a synthetic inbound packet. This mirrors what rakpeerReceiveHook
+    // does for a real packet: record it in the packet log and queue it for the
+    // registered receive hooks (dispatched on the next scheduler tick).
+    int raknet_receive(lua_State* L)
+    {
+        size_t dataLen = 0;
+        const char* data = nullptr;
+        std::string bufferCopy;
+
+        if (lua_type(L, 1) != LUA_TSTRING)
+        {
+            lua_getglobal(L, ("buffer"));
+            if (lua_istable(L, -1))
+            {
+                lua_getfield(L, -1, ("tostring"));
+                if (lua_isfunction(L, -1))
+                {
+                    lua_pushvalue(L, 1);
+                    if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isstring(L, -1))
+                    {
+                        bufferCopy = lua_tostring(L, -1);
+                        data = bufferCopy.data();
+                        dataLen = bufferCopy.size();
+                    }
+                    lua_pop(L, 1);
+                }
+                else
+                {
+                    lua_pop(L, 1);
+                }
+                lua_pop(L, 1);
+            }
+            else
+            {
+                lua_pop(L, 1);
+            }
+        }
+
+        if (!data)
+            data = luaL_checklstring(L, 1, &dataLen);
+
+        if (!data || dataLen == 0)
+        {
+            lua_pushboolean(L, false);
+            return 1;
+        }
+
+        int priority = (int)luaL_optinteger(L, 2, MEDIUM_PRIORITY);
+        int reliability = (int)luaL_optinteger(L, 3, RELIABLE_ORDERED);
+        int channel = (int)luaL_optinteger(L, 4, 0);
+
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+        uint8_t packetId = bytes[0];
+        uint8_t itemId = dataLen > 1 ? bytes[1] : 0;
+
+        if (!capturePaused)
+            RecordPacket(packetId, itemId, (uint32_t)(dataLen * 8), (PacketPriority)priority,
+                (PacketReliability)reliability, (char)channel, (uint32_t)dataLen, bytes, false, 0);
+
+        bool queued = false;
+        if (hasReceiveHooks.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> hlock(hooksMutex);
+            if (!OnSharedReceiveCallbacks.empty()) {
+                std::lock_guard<std::mutex> lock(callbackQueueMutex);
+                for (auto& cb : OnSharedReceiveCallbacks) {
+                    if (cb.packetId >= 0 && cb.packetId != (int)packetId)
+                        continue;
+
+                    QueuedCallback qc;
+                    qc.ref = cb.ref;
+                    qc.data.assign(bytes, bytes + dataLen);
+                    qc.size = (uint32_t)dataLen;
+                    qc.priority = (PacketPriority)priority;
+                    qc.reliability = (PacketReliability)reliability;
+                    qc.orderingChannel = (char)channel;
+                    qc.isSend = false;
+                    callbackQueue.push_back(std::move(qc));
+                    queued = true;
+                }
+            }
+        }
+
+        lua_pushboolean(L, queued);
+        return 1;
+    }
+
     // â”€â”€ BitStream userdata methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     static LuaBitStream* checkBitStream(lua_State* L, int idx = 1) {
@@ -1328,11 +1414,24 @@ namespace Raknet
         std::vector<uint8_t> modifiedBytes;
     };
 
+    static int pktctx_block(lua_State* L)
+    {
+        PacketContextUD* ctx = (PacketContextUD*)lua_touserdata(L, 1);
+        if (ctx)
+            ctx->blocked = true;
+        return 0;
+    }
+
     static int pktctx_index(lua_State* L)
     {
         PacketContextUD* ctx = (PacketContextUD*)lua_touserdata(L, 1);
         const char* key = luaL_checkstring(L, 2);
         if (!ctx || !key) { lua_pushnil(L); return 1; }
+
+        if (strcmp(key, ("Block")) == 0) {
+            lua_pushcfunction(L, pktctx_block, ("RaknetPacketCtx.Block"));
+            return 1;
+        }
 
         if (strcmp(key, ("Size")) == 0 || strcmp(key, ("Length")) == 0)
             lua_pushinteger(L, ctx->size);
@@ -1560,6 +1659,7 @@ namespace Raknet
         Environment->make_table_function(L, ("desyncping"), raknet_desyncping, funcnameinc++);
 
         Environment->make_table_function(L, ("send"), raknet_send_raw, funcnameinc++);
+        Environment->make_table_function(L, ("receive"), raknet_receive, funcnameinc++);
         Environment->make_table_function(L, ("Send"), rakensend_bitstream, funcnameinc++);
 
         lua_newtable(L);

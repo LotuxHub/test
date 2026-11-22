@@ -251,7 +251,7 @@ int index_hook(lua_State* L)
     if (key.empty())
         return original_index(L);
 
-    if (blocked_funcs.count(key) > 0)
+    if (blocked_funcs.count(key) > 0 || blocked_services.count(key) > 0)
     {
         luaL_error(L, "attempt to access blocked function '%s'", key.c_str());
         return 0;
