@@ -36,7 +36,7 @@ __forceinline static bool IsPtrValid(T value)
     return true;
 }
 
-inline bool signal_safe_read(const void* address, void* output, size_t size)
+__declspec(noinline) bool signal_safe_read(const void* address, void* output, size_t size)
 {
     if (!address || !output || !size)
         return false;
@@ -59,7 +59,7 @@ inline bool signal_safe_read(const void* address, void* output, size_t size)
     }
 }
 
-inline bool signal_safe_write(void* address, const void* value, size_t size)
+__declspec(noinline) bool signal_safe_write(void* address, const void* value, size_t size)
 {
     MEMORY_BASIC_INFORMATION info{};
     if (!address || !value || !VirtualQuery(address, &info, sizeof(info)) ||
@@ -73,6 +73,23 @@ inline bool signal_safe_write(void* address, const void* value, size_t size)
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         return false;
+    }
+}
+
+// SEH helper em escopo de arquivo — fora de qualquer classe/namespace para
+// que o MSVC não herde o requisito de unwinding de objetos C++ da classe
+// circundante (C2712). Usa void* para não depender de tipos declarados abaixo.
+// Chama fn(a, b, c, d) e retorna 0 em sucesso ou o código de exceção em falha.
+static DWORD TryCallVtableFn(void* fn, void* a, void* b, void* c, void* d) noexcept
+{
+    __try
+    {
+        reinterpret_cast<void(*)(void*, void*, void*, void*)>(fn)(a, b, c, d);
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return GetExceptionCode();
     }
 }
 
@@ -1745,33 +1762,31 @@ namespace Signals {
         if (strcmp(luaL_typename(luaState, 1), ("RBXScriptSignal")) != 0)
             luaL_typeerror(luaState, 1, ("RBXScriptSignal"));
 
+        // probeOwner declarado no escopo da função para ser reutilizado abaixo
+        // no dispatch (evita reler +0x18 sem proteção).
+        uintptr_t probeOwner = 0;
+
         {
             // Only the whitelisted classes can be raised from the client; anything
             // else (workspace.ChildAdded, a part's Touched) must raise instead.
-            // All pointer reads are guarded by SEH: a bad pointer produces a clean
-            // Lua error instead of a crash (the sUNC test sends a bare local signal
-            // that has no owning RemoteEvent, so the read legitimately faults).
+            // FIX: substituímos o __try/__except original por signal_safe_read
+            // (__declspec(noinline)) — replicatesignal tem std::vector em escopo
+            // e não pode conter __try (C2712); signal_safe_read mantém o __try
+            // isolado no próprio frame e não é inlinada.
             const uintptr_t probeEvent = *static_cast<uintptr_t*>(lua_touserdata(luaState, 1));
-            uintptr_t probeOwner = 0;
             char probeClass[128] = {};
-
             bool readOk = false;
+
             if (probeEvent && IsPointerValid(probeEvent))
             {
-                PEXCEPTION_POINTERS ExInfo = nullptr;
-                __try
+                uintptr_t ownerCandidate = 0;
+                if (signal_safe_read(
+                    reinterpret_cast<const void*>(probeEvent + ClientOffsets::RemoteEvent::OwningInstance),
+                    &ownerCandidate, sizeof(ownerCandidate))
+                    && ownerCandidate && IsPointerValid(ownerCandidate))
                 {
-                    uintptr_t ownerCandidate = *reinterpret_cast<uintptr_t*>(
-                        probeEvent + ClientOffsets::RemoteEvent::OwningInstance);
-                    if (ownerCandidate && IsPointerValid(ownerCandidate))
-                    {
-                        probeOwner = ownerCandidate;
-                        readOk = read_instance_class_name(probeOwner, probeClass, sizeof(probeClass));
-                    }
-                }
-                __except (ExInfo = GetExceptionInformation(), EXCEPTION_EXECUTE_HANDLER)
-                {
-                    readOk = false;
+                    probeOwner = ownerCandidate;
+                    readOk = read_instance_class_name(probeOwner, probeClass, sizeof(probeClass));
                 }
             }
 
@@ -1840,7 +1855,9 @@ namespace Signals {
         options.target = nullptr;
         options.isExcludeTarget = Roadblocks::EventTargetInclusion::OnlyTarget;
 
-        const uintptr_t owningInstance = *reinterpret_cast<uintptr_t*>(eventInstance + 0x18);
+        // FIX: reusa probeOwner (já validado pelo probe block acima) em vez de
+        // reler o mesmo offset +0x18 sem proteção. Evita um AV redundante aqui.
+        const uintptr_t owningInstance = probeOwner;
         const uintptr_t owningVTable = *reinterpret_cast<uintptr_t*>(owningInstance);
 
         const auto raiseEventInvocation = *reinterpret_cast<void(**)(
@@ -1850,12 +1867,20 @@ namespace Signals {
             Roadblocks::RemoteEventInvocationTargetOptions*
             )>(owningVTable + 0x18);
 
-        raiseEventInvocation(
-            reinterpret_cast<uintptr_t*>(owningInstance),
-            reinterpret_cast<uintptr_t*>(descriptor),
-            &argumentValues,
-            &options
+        // FIX: dispatch via TryCallVtableFn — definida no escopo de arquivo,
+        // fora de qualquer classe, para evitar C2712 (replicatesignal tem
+        // std::vector em escopo e não pode conter __try diretamente). Se
+        // crashar durante o dispatch, vira luaL_error limpo em vez de
+        // propagar para DispatchExploitImpl e parquear o executor inteiro.
+        const DWORD dispatchCode = TryCallVtableFn(
+            reinterpret_cast<void*>(raiseEventInvocation),
+            reinterpret_cast<void*>(owningInstance),
+            reinterpret_cast<void*>(descriptor),
+            reinterpret_cast<void*>(&argumentValues),
+            reinterpret_cast<void*>(&options)
         );
+        if (dispatchCode != 0)
+            luaL_error(luaState, "replicatesignal: internal fault during event dispatch (code=0x%08lX)", dispatchCode);
 
         return 0;
     }

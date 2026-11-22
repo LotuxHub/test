@@ -1097,6 +1097,40 @@ static uintptr_t stepHook(uintptr_t Job, uintptr_t Stats)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// SEH helpers — sem objetos C++ com destrutor → __try permitido com /EHa.
+// Usados por TeleportHandler para guardar chamadas que podem dar AV quando
+// o processo do jogo está sendo encerrado e a memória do scheduler já foi
+// liberada.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Chama GetDataModel() dentro de __try. Retorna false se houve AV.
+static bool TrySafeGetDataModel(uintptr_t* out) noexcept
+{
+	__try
+	{
+		*out = task_scheduler::GetDataModel();
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+// Chama IsGameLoaded() dentro de __try. Retorna false se houve AV.
+static bool TrySafeIsGameLoaded(uintptr_t dataModel) noexcept
+{
+	__try
+	{
+		return IsGameLoaded(dataModel);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
 // TeleportHandler — WHSJ vtable hook & DataModel lifecycle
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -1122,10 +1156,24 @@ void task_scheduler::TeleportHandler()
 		LOGF("TaskScheduler", "Waiting for a loaded DataModel");
 		Shared::IsInitializedOnGame = false;
 
-		uintptr_t DataModel = task_scheduler::GetDataModel();
-		while (!IsGameLoaded(DataModel)) {
+		// FIX: usa helper SEH — TeleportHandler tem objetos C++ (LOGF, etc.) e
+		// não pode conter __try diretamente (C2712). Os helpers isolam o __try
+		// em funções noexcept sem objetos com destrutor.
+		uintptr_t DataModel = 0;
+		if (!TrySafeGetDataModel(&DataModel))
+		{
+			LOGF("TaskScheduler", "TeleportHandler: AV on GetDataModel, process is likely exiting");
+			return;
+		}
+
+		while (!TrySafeIsGameLoaded(DataModel))
+		{
 			Sleep(100);
-			DataModel = task_scheduler::GetDataModel();
+			if (!TrySafeGetDataModel(&DataModel))
+			{
+				LOGF("TaskScheduler", "TeleportHandler: AV on GetDataModel (wait loop), process is likely exiting");
+				return;
+			}
 		}
 
 		Shared::LastDataModel = DataModel;
@@ -1133,7 +1181,8 @@ void task_scheduler::TeleportHandler()
 		uintptr_t GameWHSJ = 0;
 		LOGF("TaskScheduler", "Loaded DataModel=%p; waiting for hybrid script job", reinterpret_cast<void*>(Shared::LastDataModel));
 		while (!(GameWHSJ = task_scheduler::GetJobByTypeName("WaitingHybridScriptsJob", Shared::LastDataModel))) {
-			if (task_scheduler::GetDataModel() != Shared::LastDataModel || !IsGameLoaded(Shared::LastDataModel))
+			uintptr_t curDm = 0;
+			if (!TrySafeGetDataModel(&curDm) || curDm != Shared::LastDataModel || !TrySafeIsGameLoaded(Shared::LastDataModel))
 				break;
 			Sleep(50);
 		}
@@ -1184,9 +1233,15 @@ void task_scheduler::TeleportHandler()
 
 		while (true)
 		{
-			uintptr_t currentDatamodel = task_scheduler::GetDataModel();
+			uintptr_t currentDatamodel = 0;
+			if (!TrySafeGetDataModel(&currentDatamodel))
+			{
+				LOGF("TaskScheduler", "TeleportHandler: AV in monitor loop, process is likely exiting");
+				Reset();
+				return;
+			}
 
-			if (currentDatamodel != Shared::LastDataModel || !IsGameLoaded(currentDatamodel)) {
+			if (currentDatamodel != Shared::LastDataModel || !TrySafeIsGameLoaded(currentDatamodel)) {
 				LOGF("TaskScheduler", "DataModel changed/left (old=%p new=%p); resetting",
 					reinterpret_cast<void*>(Shared::LastDataModel),
 					reinterpret_cast<void*>(currentDatamodel));
