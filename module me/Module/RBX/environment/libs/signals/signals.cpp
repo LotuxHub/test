@@ -76,6 +76,26 @@ inline bool signal_safe_write(void* address, const void* value, size_t size)
     }
 }
 
+// TryReadPtr — escopo de arquivo, sem objetos C++ com destrutor, pode usar
+// __try com /EHa sem C2712. Substitui signal_safe_read para leituras de
+// ponteiro em replicatesignal: signal_safe_read usa VirtualQuery + bounds
+// check e rejeita reads que cruzam boundary de região de memória, o que
+// causa falsos negativos em alguns objetos do Roblox.
+static bool TryReadPtr(uintptr_t address, uintptr_t* out) noexcept
+{
+    if (!address || !out)
+        return false;
+    __try
+    {
+        *out = *reinterpret_cast<const uintptr_t*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 namespace ConnOffsets {
     namespace Connection = Offsets::signal_offsets::connection;
     namespace SlotWrapper = Offsets::signal_offsets::slot_wrapper;
@@ -259,7 +279,8 @@ static bool connection_once_state(uintptr_t connection, bool retire = false) {
     if (retire) {
         fired = 1;
         signal_safe_write(reinterpret_cast<void*>(slot + ClientOffsets::Signal::SignalSlot::onceFired), &fired, sizeof(fired));
-    } else {
+    }
+    else {
         signal_safe_read(reinterpret_cast<void*>(slot + ClientOffsets::Signal::SignalSlot::onceFired), &fired, sizeof(fired));
     }
     return fired == 1;
@@ -804,7 +825,7 @@ namespace Signals {
 
     int fireproximityprompt(lua_State* L)
     {
-        
+
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         lua_getglobal(L, ("typeof"));
@@ -832,7 +853,7 @@ namespace Signals {
 
     int fireclickdetector(lua_State* L)
     {
-        
+
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         auto FireDistance = luaL_optnumber(L, 2, 0);
@@ -1038,7 +1059,8 @@ namespace Signals {
                     out.ok = true;
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
             out.ok = false;
         }
         return out;
@@ -1054,7 +1076,8 @@ namespace Signals {
                 out.walked = walk_connections_safe(sentinelBase);
                 out.ok = true;
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
             out.ok = false;
         }
         return out;
@@ -1062,7 +1085,7 @@ namespace Signals {
 
     int getconnectionsV2(lua_State* L)
     {
-        
+
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         const char* typeName = luaL_typename(L, 1);
@@ -1185,7 +1208,7 @@ namespace Signals {
 
     int getconnections(lua_State* L)
     {
-        
+
         luaL_checktype(L, 1, LUA_TUSERDATA);
         if (strcmp(luaL_typename(L, 1), ("RBXScriptSignal")) != 0)
             luaL_typeerror(L, 1, ("RBXScriptSignal"));
@@ -1456,7 +1479,7 @@ namespace Signals {
 
     int firesignal(lua_State* L)
     {
-        
+
         luaL_checktype(L, 1, LUA_TUSERDATA);
         if (strcmp(luaL_typename(L, 1), ("RBXScriptSignal")) != 0)
             luaL_typeerror(L, 1, ("RBXScriptSignal"));
@@ -1564,7 +1587,7 @@ namespace Signals {
 
     int getconnection(lua_State* L)
     {
-        
+
         luaL_checktype(L, 1, LUA_TUSERDATA);
         const int index = luaL_checkinteger(L, 2);
         if (index < 1)
@@ -1581,7 +1604,7 @@ namespace Signals {
 
     int setproximitypromptduration(lua_State* L)
     {
-        
+
         if (!lua_isuserdata(L, 1) || !lua_isnumber(L, 2))
             return 0;
 
@@ -1601,7 +1624,7 @@ namespace Signals {
 
     int getproximitypromptduration(lua_State* L)
     {
-        
+
         if (!lua_isuserdata(L, 1)) {
             lua_pushnumber(L, 0);
             return 1;
@@ -1736,7 +1759,7 @@ namespace Signals {
 
     int replicatesignal(lua_State* luaState)
     {
-        
+
         luaL_checktype(luaState, 1, LUA_TUSERDATA);
 
         if (strcmp(luaL_typename(luaState, 1), ("RBXScriptSignal")) != 0)
@@ -1744,8 +1767,10 @@ namespace Signals {
 
         const uintptr_t userdata = reinterpret_cast<uintptr_t>(lua_touserdata(luaState, 1));
         uintptr_t eventInstance = 0;
-        if (!signal_safe_read(reinterpret_cast<void*>(userdata), &eventInstance, sizeof(eventInstance)) ||
-            !eventInstance || !IsPointerValid(eventInstance))
+        // TryReadPtr: SEH puro no escopo de arquivo — sem VirtualQuery/bounds
+        // check extra que signal_safe_read faz e que gera falso negativo quando
+        // o objeto cruza boundary de região de memória.
+        if (!TryReadPtr(userdata, &eventInstance) || !eventInstance || !IsPointerValid(eventInstance))
             luaL_error(luaState, ("signal cannot be replicated"));
 
         // Only signals owned by a class the client may raise can be replicated.
@@ -1753,8 +1778,7 @@ namespace Signals {
         // descriptor — resolve the instance first, then read its class name.
         uintptr_t owningInstance = 0;
         char ownerClass[128] = {};
-        if (!signal_safe_read(reinterpret_cast<void*>(eventInstance + ClientOffsets::RemoteEvent::OwningInstance),
-                &owningInstance, sizeof(owningInstance)) ||
+        if (!TryReadPtr(eventInstance + ClientOffsets::RemoteEvent::OwningInstance, &owningInstance) ||
             !owningInstance || !IsPointerValid(owningInstance))
             luaL_error(luaState, ("signal cannot be replicated"));
         // Only refuse signals that clearly cannot be client-raised (debUNC
@@ -1848,7 +1872,7 @@ namespace Signals {
         return 0;
     }
 
- 
+
 
     static void dispatch_touch_signal(lua_State* L, int ownerIndex, int otherIndex, const char* signalName)
     {
@@ -1882,7 +1906,7 @@ namespace Signals {
 
 
     int firetouchinterest(lua_State* LS) {
-        
+
         luaL_checktype(LS, 1, LUA_TUSERDATA);
         luaL_checktype(LS, 2, LUA_TUSERDATA);
 
@@ -1901,7 +1925,8 @@ namespace Signals {
             if (s_activeTouches.contains(pairKey)) {
                 Toggle = 1;
                 s_activeTouches.erase(pairKey);
-            } else {
+            }
+            else {
                 Toggle = 0;
                 s_activeTouches.insert(pairKey);
             }
@@ -1944,55 +1969,55 @@ namespace Signals {
 
     int getsignalwhitelist(lua_State* L)
     {
-        
+
         lua_newtable(L);
         int idx = 1;
 
         const char* signals[][2] = {
-            {("Kill"), ("Player")},
-            {("Died"), ("Humanoid")},
-            {("Changed"), ("BasePart")},
-            {("Touched"), ("BasePart")},
-            {("TouchEnded"), ("BasePart")},
-            {("ChildAdded"), ("Instance")},
-            {("ChildRemoved"), ("Instance")},
-            {("DescendantAdded"), ("Instance")},
-            {("DescendantRemoving"), ("Instance")},
-            {("AncestryChanged"), ("Instance")},
-            {("PropertyChanged"), ("Instance")},
-            {("GetPropertyChangedSignal"), ("Instance")},
-            {("AttributeChanged"), ("Instance")},
-            {("AttributeChanged"), ("Instance")},
-            {("InputBegan"), ("UserInputService")},
-            {("InputEnded"), ("UserInputService")},
-            {("InputChanged"), ("UserInputService")},
-            {("RenderStepped"), ("RunService")},
-            {("Heartbeat"), ("RunService")},
-            {("Stepped"), ("RunService")},
-            {("Button1Down"), ("Mouse")},
-            {("Button1Up"), ("Mouse")},
-            {("Button2Down"), ("Mouse")},
-            {("Button2Up"), ("Mouse")},
-            {("Idle"), ("Mouse")},
-            {("Move"), ("Mouse")},
-            {("WheelForward"), ("Mouse")},
-            {("WheelBackward"), ("Mouse")},
-            {("CharacterAdded"), ("Players")},
-            {("CharacterRemoving"), ("Players")},
-            {("PlayerAdded"), ("Players")},
-            {("PlayerRemoving"), ("Players")},
-            {("Chatted"), ("Players")},
-            {("MembershipChanged"), ("Players")},
-            {("Activated"), ("Tool")},
-            {("Deactivated"), ("Tool")},
-            {("Equipped"), ("Tool")},
-            {("Unequipped"), ("Tool")},
-            {("OnServerEvent"), ("RemoteEvent")},
-            {("OnClientEvent"), ("RemoteEvent")},
-            {("Triggered"), ("ProximityPrompt")},
-            {("TriggerEnded"), ("ProximityPrompt")},
-            {("MouseClick"), ("ClickDetector")},
-            {("RightMouseClick"), ("ClickDetector")},
+            { ("Kill"), ("Player") },
+            { ("Died"), ("Humanoid") },
+            { ("Changed"), ("BasePart") },
+            { ("Touched"), ("BasePart") },
+            { ("TouchEnded"), ("BasePart") },
+            { ("ChildAdded"), ("Instance") },
+            { ("ChildRemoved"), ("Instance") },
+            { ("DescendantAdded"), ("Instance") },
+            { ("DescendantRemoving"), ("Instance") },
+            { ("AncestryChanged"), ("Instance") },
+            { ("PropertyChanged"), ("Instance") },
+            { ("GetPropertyChangedSignal"), ("Instance") },
+            { ("AttributeChanged"), ("Instance") },
+            { ("AttributeChanged"), ("Instance") },
+            { ("InputBegan"), ("UserInputService") },
+            { ("InputEnded"), ("UserInputService") },
+            { ("InputChanged"), ("UserInputService") },
+            { ("RenderStepped"), ("RunService") },
+            { ("Heartbeat"), ("RunService") },
+            { ("Stepped"), ("RunService") },
+            { ("Button1Down"), ("Mouse") },
+            { ("Button1Up"), ("Mouse") },
+            { ("Button2Down"), ("Mouse") },
+            { ("Button2Up"), ("Mouse") },
+            { ("Idle"), ("Mouse") },
+            { ("Move"), ("Mouse") },
+            { ("WheelForward"), ("Mouse") },
+            { ("WheelBackward"), ("Mouse") },
+            { ("CharacterAdded"), ("Players") },
+            { ("CharacterRemoving"), ("Players") },
+            { ("PlayerAdded"), ("Players") },
+            { ("PlayerRemoving"), ("Players") },
+            { ("Chatted"), ("Players") },
+            { ("MembershipChanged"), ("Players") },
+            { ("Activated"), ("Tool") },
+            { ("Deactivated"), ("Tool") },
+            { ("Equipped"), ("Tool") },
+            { ("Unequipped"), ("Tool") },
+            { ("OnServerEvent"), ("RemoteEvent") },
+            { ("OnClientEvent"), ("RemoteEvent") },
+            { ("Triggered"), ("ProximityPrompt") },
+            { ("TriggerEnded"), ("ProximityPrompt") },
+            { ("MouseClick"), ("ClickDetector") },
+            { ("RightMouseClick"), ("ClickDetector") },
         };
 
         for (auto& sig : signals) {
@@ -2086,7 +2111,7 @@ namespace Signals {
     {
         uintptr_t classDescriptor = 0;
         if (!signal_safe_read(reinterpret_cast<void*>(instance + Offsets::Instance::ClassDescriptor),
-                &classDescriptor, sizeof(classDescriptor)) ||
+            &classDescriptor, sizeof(classDescriptor)) ||
             !classDescriptor || !IsPointerValid(classDescriptor))
             return false;
 
@@ -2125,7 +2150,7 @@ namespace Signals {
 
     int cansignalreplicate(lua_State* L)
     {
-        
+
         if (!lua_isuserdata(L, 1)) {
             lua_pushboolean(L, false);
             return 1;
@@ -2290,57 +2315,57 @@ namespace Signals {
         //   type node + 0x08 = MSVC std::string with the type name ("Instance")
         //   slot + 0x68 = MSVC std::string with the argument name ("otherPart")
         auto emit = [&](uintptr_t slot) -> bool
-        {
-            if (!slot || !IsPointerValid(slot))
-                return false;
+            {
+                if (!slot || !IsPointerValid(slot))
+                    return false;
 
-            uintptr_t node = 0;
-            if (!signal_safe_read(reinterpret_cast<void*>(slot), &node, sizeof(node)) ||
-                !node || !IsPointerValid(node))
-                return false;
+                uintptr_t node = 0;
+                if (!signal_safe_read(reinterpret_cast<void*>(slot), &node, sizeof(node)) ||
+                    !node || !IsPointerValid(node))
+                    return false;
 
-            char typeBuf[128] = { 0 };
-            read_msvc_string_at(node + 0x08, typeBuf, sizeof(typeBuf));
-            if (!typeBuf[0] || !IsIdentifierText(typeBuf))
-                return false;
+                char typeBuf[128] = { 0 };
+                read_msvc_string_at(node + 0x08, typeBuf, sizeof(typeBuf));
+                if (!typeBuf[0] || !IsIdentifierText(typeBuf))
+                    return false;
 
-            char nameBuf[128] = { 0 };
-            uintptr_t namePtr = 0;
-            if (signal_safe_read(reinterpret_cast<void*>(slot + 0x68), &namePtr, sizeof(namePtr)) &&
-                namePtr && IsPointerValid(namePtr))
-                read_msvc_string_at(namePtr, nameBuf, sizeof(nameBuf));
+                char nameBuf[128] = { 0 };
+                uintptr_t namePtr = 0;
+                if (signal_safe_read(reinterpret_cast<void*>(slot + 0x68), &namePtr, sizeof(namePtr)) &&
+                    namePtr && IsPointerValid(namePtr))
+                    read_msvc_string_at(namePtr, nameBuf, sizeof(nameBuf));
 
-            // Build 0.748 renamed several RBXScriptSignal parameters. UNC's
-            // debUNC suite still asserts the historic names, so normalise the
-            // known renames (same approach other executors use).
-            struct NameFix { const char* from; const char* to; };
-            static const NameFix kNameFixes[] = {
-                { "position", "otherPart" },          // BasePart.Touched
-                { "input",    "gameProcessedEvent" }, // UserInputService.InputBegan arg 2
-            };
-            for (const NameFix& Fix : kNameFixes)
-                if (std::strcmp(nameBuf, Fix.from) == 0)
+                // Build 0.748 renamed several RBXScriptSignal parameters. UNC's
+                // debUNC suite still asserts the historic names, so normalise the
+                // known renames (same approach other executors use).
+                struct NameFix { const char* from; const char* to; };
+                static const NameFix kNameFixes[] = {
+                    { "position", "otherPart" },          // BasePart.Touched
+                    { "input",    "gameProcessedEvent" }, // UserInputService.InputBegan arg 2
+                };
+                for (const NameFix& Fix : kNameFixes)
+                    if (std::strcmp(nameBuf, Fix.from) == 0)
+                    {
+                        std::strcpy(nameBuf, Fix.to);
+                        break;
+                    }
+
+                if (wantInfo)
                 {
-                    std::strcpy(nameBuf, Fix.to);
-                    break;
+                    lua_newtable(L);
+                    lua_pushstring(L, IsIdentifierText(nameBuf) ? nameBuf : "Unknown");
+                    lua_setfield(L, -2, ("Name"));
+                    lua_pushstring(L, typeBuf);
+                    lua_setfield(L, -2, ("Type"));
+                    lua_rawseti(L, -2, idx++);
                 }
-
-            if (wantInfo)
-            {
-                lua_newtable(L);
-                lua_pushstring(L, IsIdentifierText(nameBuf) ? nameBuf : "Unknown");
-                lua_setfield(L, -2, ("Name"));
-                lua_pushstring(L, typeBuf);
-                lua_setfield(L, -2, ("Type"));
-                lua_rawseti(L, -2, idx++);
-            }
-            else
-            {
-                lua_pushstring(L, typeBuf);
-                lua_rawseti(L, -2, idx++);
-            }
-            return true;
-        };
+                else
+                {
+                    lua_pushstring(L, typeBuf);
+                    lua_rawseti(L, -2, idx++);
+                }
+                return true;
+            };
 
         if (signature && signatureEnd > signature)
         {
@@ -2349,8 +2374,8 @@ namespace Signals {
             if (stride && stride < 0x1000)
             {
                 for (uintptr_t cur = signature + start;
-                     cur < signatureEnd && idx < 64;
-                     cur += stride)
+                    cur < signatureEnd && idx < 64;
+                    cur += stride)
                     emit(cur);
             }
         }
@@ -2499,7 +2524,7 @@ namespace Signals {
 
     int getrendersteppedlist(lua_State* L)
     {
-        
+
         lua_newtable(L);
         const int resultIndex = lua_gettop(L);
         int counter = 1;
@@ -2583,7 +2608,7 @@ namespace Signals {
     };
 
     int Defersignal(lua_State* L) {
-        
+
         luaL_checktype(L, 1, LUA_TUSERDATA);
 
         std::string Check = luaL_typename(L, 1);

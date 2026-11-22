@@ -278,21 +278,21 @@ inline bool CheckMemory(uintptr_t address) {
 
 inline lua_State* GetLuaStateForInstance(uintptr_t sc)
 {
-    if (!sc) return nullptr;
-    __try
-    {
-        *reinterpret_cast<BOOLEAN*>(sc + Offsets::ExtraSpace::RequireBypass) = TRUE;
-        uintptr_t identity = 2;
-        uintptr_t script = 0;
-        lua_State* state = Roblox::GetLuaStateForInstance(sc, &identity, &script);
-        if (!state || !CheckMemory(reinterpret_cast<uintptr_t>(state)) || state->tt != LUA_TTHREAD || !state->global)
-            return nullptr;
-        return state;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return nullptr;
-    }
+	if (!sc) return nullptr;
+	__try
+	{
+		*reinterpret_cast<BOOLEAN*>(sc + Offsets::ExtraSpace::RequireBypass) = TRUE;
+		uintptr_t identity = 2;
+		uintptr_t script = 0;
+		lua_State* state = Roblox::GetLuaStateForInstance(sc, &identity, &script);
+		if (!state || !CheckMemory(reinterpret_cast<uintptr_t>(state)) || state->tt != LUA_TTHREAD || !state->global)
+			return nullptr;
+		return state;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return nullptr;
+	}
 }
 
 lua_State* task_scheduler::GetLuaState(uintptr_t ScriptContext, uintptr_t Identity, uintptr_t Script)
@@ -357,13 +357,20 @@ int ScriptsHandler(lua_State* L)
 
 static void RestoreJobVtableSafely()
 {
+	// Guard: only restore if the vtable slot still holds OUR hooked table.
+	// When Roblox destroys the job via delete, the heap allocator overwrites
+	// the vtable pointer with its own free-list metadata, so the check below
+	// will be false and we skip the write — avoiding a heap-corruption crash.
 	__try
 	{
-		if (Shared::LastWaitingHybridScriptsJob && Shared::OriginalHybridJobVtable &&
-			CheckMemory(Shared::LastWaitingHybridScriptsJob))
-		{
+		if (!Shared::LastWaitingHybridScriptsJob || !Shared::OriginalHybridJobVtable ||
+			!Shared::HybridJobVtable)
+			return;
+		if (!CheckMemory(Shared::LastWaitingHybridScriptsJob))
+			return;
+		uintptr_t* currentVtable = *reinterpret_cast<uintptr_t**>(Shared::LastWaitingHybridScriptsJob);
+		if (currentVtable == Shared::HybridJobVtable)
 			*reinterpret_cast<uintptr_t**>(Shared::LastWaitingHybridScriptsJob) = Shared::OriginalHybridJobVtable;
-		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
 	{
@@ -414,11 +421,10 @@ void Reset()
 	Shared::ExecutorClosures.clear();
 	Raknet::ResetHook();
 
-	ImGuiToast toast(ImGuiToastType_Info, 5000);
-	toast.set_title("TPHandler");
-	toast.set_content("Cleanup done");
-
-	ImGui::InsertNotification(toast);
+	// NOTE: ImGui::InsertNotification is NOT thread-safe. TeleportHandler runs on a
+	// background thread while the render thread owns ImGui state. Calling it here
+	// caused a race condition that crashed Roblox after leaving a game.
+	LOGF("TaskScheduler", "Reset complete (TPHandler cleanup done)");
 }
 
 namespace
@@ -827,8 +833,8 @@ static bool InitializeGame()
 
 static bool ExecuteGameImpl()
 {
-    // Periodic: log any object named/ClassName'd "Actor" in the game tree.
-    Actor::ScanForActorScripts();
+	// Periodic: log any object named/ClassName'd "Actor" in the game tree.
+	Actor::ScanForActorScripts();
 	// Partial init stages park the executor entirely: queued scripts, drawing,
 	// RakNet and yields all need the fully built environment.
 	if (g_PartialInit || g_InitStage < kFullInitStage || !Shared::ExploitThread)
@@ -972,19 +978,58 @@ static uintptr_t stepHook(uintptr_t Job, uintptr_t Stats)
 // TeleportHandler — WHSJ vtable hook & DataModel lifecycle
 // ══════════════════════════════════════════════════════════════════════════════
 
+// SEH helper: read a raw pointer — returns false on AV (memory unmapped / process exiting).
+// Unlike GetDataModel() which catches its own AV and returns 0, this lets the caller
+// distinguish "returned 0 cleanly" from "threw AV" so TeleportHandler can exit when
+// the process is shutting down.
+static bool TryReadPtr(uintptr_t addr, uintptr_t* out) noexcept
+{
+	__try { *out = *reinterpret_cast<uintptr_t*>(addr); return true; }
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 void task_scheduler::TeleportHandler()
 {
 	constexpr size_t kJobVtableSlots = 9;
+
+	// ── Pre-sync FFlags in background ────────────────────────────────────────────
+	// SyncClientLuauFlags walks the Roblox registry (can take 1-3 s). Running it
+	// here, before the vtable hook, keeps the cost off the game thread entirely.
+	// The static AlreadySynced guard inside the function makes the later call in
+	// InitializeGameImpl() a no-op — that is what eliminates the first-entry freeze.
+	{
+		const auto t0 = std::chrono::steady_clock::now();
+		SyncClientLuauFlags();
+		LOGF("TaskScheduler", "FFlag pre-sync took %lld ms",
+			static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - t0).count()));
+	}
 
 	while (true)
 	{
 		LOGF("TaskScheduler", "Waiting for a loaded DataModel");
 		Shared::IsInitializedOnGame = false;
 
-		uintptr_t DataModel = task_scheduler::GetDataModel();
-		while (!IsGameLoaded(DataModel)) {
+		// Outer wait: loop until a game DataModel with PlaceId > 0 appears.
+		// Use TryReadPtr on the raw FakeDataModelPointer so we can detect AV
+		// (process exiting) and exit cleanly instead of looping forever.
+		uintptr_t DataModel = 0;
+		for (;;)
+		{
+			uintptr_t fakePtr = 0;
+			if (!TryReadPtr(Offsets::DataModel::FakeDataModelPointer, &fakePtr))
+			{
+				LOGF("TaskScheduler", "TeleportHandler: AV on FakeDataModelPointer, process exiting");
+				return;
+			}
+			DataModel = 0;
+			if (fakePtr)
+				TryReadPtr(fakePtr + Offsets::DataModel::FakeDataModelToDataModel, &DataModel);
+
+			if (IsGameLoaded(DataModel))
+				break;
+
 			Sleep(100);
-			DataModel = task_scheduler::GetDataModel();
 		}
 
 		Shared::LastDataModel = DataModel;
@@ -1031,9 +1076,20 @@ void task_scheduler::TeleportHandler()
 		*reinterpret_cast<uintptr_t**>(Shared::LastWaitingHybridScriptsJob) = static_cast<uintptr_t*>(Shared::HybridJobVtable);
 		LOGF("TaskScheduler", "Installed job step callback; original=%p", Shared::OriginalStepFunction);
 
+		// ── Monitor loop: watch for game exit / teleport ──────────────────────────
 		while (true)
 		{
-			uintptr_t currentDatamodel = task_scheduler::GetDataModel();
+			uintptr_t fakePtr = 0;
+			if (!TryReadPtr(Offsets::DataModel::FakeDataModelPointer, &fakePtr))
+			{
+				// AV = process is exiting; skip Reset() (ImGui and game state are gone)
+				LOGF("TaskScheduler", "TeleportHandler: AV in monitor loop, process exiting");
+				return;
+			}
+
+			uintptr_t currentDatamodel = 0;
+			if (fakePtr)
+				TryReadPtr(fakePtr + Offsets::DataModel::FakeDataModelToDataModel, &currentDatamodel);
 
 			if (currentDatamodel != Shared::LastDataModel || !IsGameLoaded(currentDatamodel)) {
 				LOGF("TaskScheduler", "DataModel changed/left (old=%p new=%p); resetting",
@@ -1067,77 +1123,77 @@ void task_scheduler::RequestExecution(std::string Script)
 
 uintptr_t task_scheduler::GetJobByTypeName(const std::string& TypeName, uintptr_t DataModel)
 {
-    __try
-    {
-	uintptr_t task_scheduler =
-		*reinterpret_cast<uintptr_t*>(
-			Offsets::Scheduler::TaskScheduler
-			);
-
-	if (!task_scheduler)
-		return 0;
-
-	uintptr_t JobsStart =
-		*reinterpret_cast<uintptr_t*>(
-			task_scheduler + Offsets::Scheduler::JobStart
-			);
-
-	uintptr_t JobsEnd =
-		*reinterpret_cast<uintptr_t*>(
-			task_scheduler + Offsets::Scheduler::JobEnd
-			);
-
-	if (!JobsStart || !JobsEnd || JobsStart >= JobsEnd ||
-		(JobsEnd - JobsStart) % 0x10 != 0 || (JobsEnd - JobsStart) / 0x10 > 65536)
-		return 0;
-
-	const size_t nameLen = TypeName.size();
-	if (nameLen == 0 || nameLen >= 0x100)
-		return 0;
-
-
-	for (uintptr_t Current = JobsStart;
-		Current < JobsEnd;
-		Current += 0x10)
+	__try
 	{
-		uintptr_t Job =
-			*reinterpret_cast<uintptr_t*>(Current);
+		uintptr_t task_scheduler =
+			*reinterpret_cast<uintptr_t*>(
+				Offsets::Scheduler::TaskScheduler
+				);
 
-		if (!Job)
-			continue;
+		if (!task_scheduler)
+			return 0;
 
-		const uintptr_t nameAddress = Job + Offsets::Scheduler::JobTypeName;
-		if (!CheckMemory(nameAddress + 0x18))
-			continue;
-		const size_t size = *reinterpret_cast<const size_t*>(nameAddress + 0x10);
-		const size_t capacity = *reinterpret_cast<const size_t*>(nameAddress + 0x18);
-		if (size != nameLen || capacity < size)
-			continue;
-		const char* candidate = capacity < 16
-			? reinterpret_cast<const char*>(nameAddress)
-			: *reinterpret_cast<const char* const*>(nameAddress);
-		if (candidate && CheckMemory(reinterpret_cast<uintptr_t>(candidate)) &&
-			CheckMemory(reinterpret_cast<uintptr_t>(candidate) + nameLen))
+		uintptr_t JobsStart =
+			*reinterpret_cast<uintptr_t*>(
+				task_scheduler + Offsets::Scheduler::JobStart
+				);
+
+		uintptr_t JobsEnd =
+			*reinterpret_cast<uintptr_t*>(
+				task_scheduler + Offsets::Scheduler::JobEnd
+				);
+
+		if (!JobsStart || !JobsEnd || JobsStart >= JobsEnd ||
+			(JobsEnd - JobsStart) % 0x10 != 0 || (JobsEnd - JobsStart) / 0x10 > 65536)
+			return 0;
+
+		const size_t nameLen = TypeName.size();
+		if (nameLen == 0 || nameLen >= 0x100)
+			return 0;
+
+
+		for (uintptr_t Current = JobsStart;
+			Current < JobsEnd;
+			Current += 0x10)
 		{
-			if (memcmp(candidate, TypeName.c_str(), nameLen) != 0)
-				continue;
-			if (DataModel)
-			{
-				const uintptr_t Context = *reinterpret_cast<uintptr_t*>(Job + ClientOffsets::jobs_offsets::scriptContext);
-				if (!Context || !CheckMemory(Context + ClientOffsets::ScriptContext::DataModel))
-					continue;
-				const uintptr_t Owner = *reinterpret_cast<uintptr_t*>(Context + ClientOffsets::ScriptContext::DataModel);
-				if (Owner != DataModel && Owner + ClientOffsets::DataModel::InstanceSubobject != DataModel)
-					continue;
-			}
-			return Job;
-		}
-	}
+			uintptr_t Job =
+				*reinterpret_cast<uintptr_t*>(Current);
 
-	return 0;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return 0;
-    }
+			if (!Job)
+				continue;
+
+			const uintptr_t nameAddress = Job + Offsets::Scheduler::JobTypeName;
+			if (!CheckMemory(nameAddress + 0x18))
+				continue;
+			const size_t size = *reinterpret_cast<const size_t*>(nameAddress + 0x10);
+			const size_t capacity = *reinterpret_cast<const size_t*>(nameAddress + 0x18);
+			if (size != nameLen || capacity < size)
+				continue;
+			const char* candidate = capacity < 16
+				? reinterpret_cast<const char*>(nameAddress)
+				: *reinterpret_cast<const char* const*>(nameAddress);
+			if (candidate && CheckMemory(reinterpret_cast<uintptr_t>(candidate)) &&
+				CheckMemory(reinterpret_cast<uintptr_t>(candidate) + nameLen))
+			{
+				if (memcmp(candidate, TypeName.c_str(), nameLen) != 0)
+					continue;
+				if (DataModel)
+				{
+					const uintptr_t Context = *reinterpret_cast<uintptr_t*>(Job + ClientOffsets::jobs_offsets::scriptContext);
+					if (!Context || !CheckMemory(Context + ClientOffsets::ScriptContext::DataModel))
+						continue;
+					const uintptr_t Owner = *reinterpret_cast<uintptr_t*>(Context + ClientOffsets::ScriptContext::DataModel);
+					if (Owner != DataModel && Owner + ClientOffsets::DataModel::InstanceSubobject != DataModel)
+						continue;
+				}
+				return Job;
+			}
+		}
+
+		return 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return 0;
+	}
 }
